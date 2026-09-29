@@ -240,7 +240,7 @@ class OutboxPublisherIntegrationTest extends IntegrationTestBase {
 
     private long paidOrder() throws Exception {
         Product lamp = createProduct("Published Lamp", "10.00", 10);
-        addToCart(session, lamp.getId(), 1);
+        addToCart(user, lamp.getId(), 1);
         String body = mockMvc.perform(checkout()).andReturn().getResponse().getContentAsString();
         assertThat(JsonPath.<String>read(body, "$.status")).isEqualTo("PAID");
         return ((Number) JsonPath.read(body, "$.id")).longValue();

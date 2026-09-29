@@ -70,6 +70,32 @@ class PaymentClientTest {
     }
 
     @Test
+    void everyPaymentAndReconciliationCallCarriesTheServiceToken() {
+        server.respondWith(fail(503), succeed());
+
+        client.pay(request, null);
+        client.findByIdempotencyKey(request.idempotencyKey());
+
+        // Both attempts of the retried POST and the reconciliation GET are authenticated.
+        assertThat(server.postRequests()).hasSize(2);
+        assertThat(server.postRequests()).extracting(sent -> sent.header("Authorization"))
+                .containsOnly("Bearer " + FakePaymentServer.SERVICE_TOKEN);
+        assertThat(server.lookupRequests()).singleElement()
+                .satisfies(sent -> assertThat(sent.header("Authorization")).isEqualTo("Bearer " + FakePaymentServer.SERVICE_TOKEN));
+    }
+
+    @Test
+    void rejectedServiceTokenIsNotRetriedAndNothingWasProcessed() {
+        PaymentClient wrongToken = client(server.baseUrl(),
+                new PaymentClientProperties.CircuitBreaker(50, 100, 100, Duration.ofSeconds(10), 1), false, "wrong-token");
+
+        // 401 is a 4xx: payment-service refused the request, so it provably did not process it; retrying cannot help.
+        assertThat(wrongToken.pay(request, null)).isInstanceOf(PaymentOutcome.NotProcessed.class);
+        assertThat(server.postRequests()).hasSize(1);
+        assertThat(server.paymentCount()).isZero();
+    }
+
+    @Test
     void declinedPaymentIsABusinessResultAndIsNotRetried() {
         server.respondWith(decline());
 
@@ -259,13 +285,19 @@ class PaymentClientTest {
 
     private PaymentClient client(String baseUrl, PaymentClientProperties.CircuitBreaker circuitBreakerProperties,
                                  boolean forwardScenarioHeader) {
+        return client(baseUrl, circuitBreakerProperties, forwardScenarioHeader, FakePaymentServer.SERVICE_TOKEN);
+    }
+
+    private PaymentClient client(String baseUrl, PaymentClientProperties.CircuitBreaker circuitBreakerProperties,
+                                 boolean forwardScenarioHeader, String serviceToken) {
         PaymentClientProperties properties = new PaymentClientProperties(
                 URI.create(baseUrl),
                 Duration.ofMillis(300),
                 READ_TIMEOUT,
                 forwardScenarioHeader,
                 new PaymentClientProperties.Retry(3, Duration.ofMillis(10), 2.0, 0.5),
-                circuitBreakerProperties);
+                circuitBreakerProperties,
+                serviceToken);
         circuitBreaker = PaymentClientConfiguration.circuitBreaker(properties.circuitBreaker());
         return new PaymentClient(PaymentClientConfiguration.restClient(properties), circuitBreaker,
                 PaymentClientConfiguration.retry(properties.retry()), properties.forwardScenarioHeader());

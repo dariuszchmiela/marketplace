@@ -1,7 +1,6 @@
 package pl.dch.marketplace.common;
 
 import org.junit.jupiter.api.Test;
-import org.springframework.http.MediaType;
 import pl.dch.marketplace.IntegrationTestBase;
 import pl.dch.marketplace.cart.CartItem;
 import pl.dch.marketplace.product.Product;
@@ -9,7 +8,6 @@ import pl.dch.marketplace.product.Product;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.hasSize;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
-import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -19,20 +17,13 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 class ApiErrorIntegrationTest extends IntegrationTestBase {
 
     @Test
-    void missingSessionHeader() throws Exception {
+    void notLoggedInIsAJson401() throws Exception {
         mockMvc.perform(get("/api/cart"))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.status").value(400))
-                .andExpect(jsonPath("$.code").value("MISSING_SESSION_ID"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.status").value(401))
+                .andExpect(jsonPath("$.code").value("AUTHENTICATION_REQUIRED"))
                 .andExpect(jsonPath("$.path").value("/api/cart"))
                 .andExpect(jsonPath("$.timestamp").exists());
-    }
-
-    @Test
-    void sessionHeaderThatIsNotUuid() throws Exception {
-        mockMvc.perform(get("/api/cart").header(SESSION_HEADER, "not-a-uuid"))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.code").value("INVALID_SESSION_ID"));
     }
 
     @Test
@@ -113,10 +104,10 @@ class ApiErrorIntegrationTest extends IntegrationTestBase {
 
     @Test
     void unknownEndpointAndWrongMethodUseTheSameErrorShape() throws Exception {
-        mockMvc.perform(get("/api/does-not-exist"))
+        mockMvc.perform(getWithSession("/api/does-not-exist"))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value("NOT_FOUND"));
-        mockMvc.perform(post("/api/products").contentType(MediaType.APPLICATION_JSON).content("{}"))
+        mockMvc.perform(postWithSession("/api/products", "{}"))
                 .andExpect(status().isMethodNotAllowed())
                 .andExpect(jsonPath("$.code").value("METHOD_NOT_ALLOWED"));
     }

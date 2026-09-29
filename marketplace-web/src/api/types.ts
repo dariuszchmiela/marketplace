@@ -56,3 +56,9 @@ export interface ApiErrorBody {
   path: string | null
   fieldErrors: { field: string; message: string }[]
 }
+
+/** The logged-in user as the backend exposes it (no internal ids beyond the user id, no password data). */
+export interface User {
+  id: number
+  email: string
+}

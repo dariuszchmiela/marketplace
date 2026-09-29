@@ -186,7 +186,7 @@ class OrderOutboxEventsIntegrationTest extends IntegrationTestBase {
 
     private Product productInCart(String name, String price, int quantity) throws Exception {
         Product product = createProduct(name, price, 10);
-        addToCart(session, product.getId(), quantity);
+        addToCart(user, product.getId(), quantity);
         return product;
     }
 

@@ -4,10 +4,20 @@ A small, working marketplace used as a training ground for a Senior Fullstack (J
 technical interview. It is **not** a portfolio clone of a real marketplace: every piece exists to give
 concrete, runnable examples for interview topics (Stream API, money, transactions, JPA, REST, React state,
 HTTP resilience, idempotency, distributed failures, concurrency, thread pools, virtual threads, Kafka,
-transactional outbox, eventual consistency, …).
+transactional outbox, eventual consistency, authentication, sessions, CSRF, CORS, …).
 
-Current state: **Phase 4, Kafka + transactional outbox + eventual consistency** (on top of Phase 3, concurrency lab,
-and Phase 2, payment integration + resilience):
+Current state: **Phase 5, security** (on top of Phase 4 Kafka + outbox, Phase 3 concurrency lab and Phase 2 payment
+integration):
+
+- **Users and login:** register/login/logout with email + password (BCrypt), Spring Security with a **server-side
+  session** stored in PostgreSQL (Spring Session JDBC) and identified by the HttpOnly `MARKETPLACE_SESSION` cookie.
+  One model only, no JWT (the trade-off is documented in `docs/architecture.md`).
+- **Ownership:** carts and orders belong to the logged-in user; the owner key comes from the session, never from the
+  browser (the old `X-Session-Id` header is gone). Another user's order is a 404.
+- **CSRF** protection for every state-changing request (cookie `XSRF-TOKEN` → header `X-XSRF-TOKEN`), **CORS** only for
+  configured origins, JSON 401/403 errors, default security headers.
+- **Service-to-service:** marketplace → payment-service with a shared bearer token; order-activity-service's HTTP API
+  (projection, dev simulation) behind its own internal token. Kafka stays unauthenticated local-dev infrastructure.
 
 ```text
 Product list → Cart → Checkout → Order (PAYMENT_PENDING) → payment-service → PAID / PAYMENT_FAILED / PAYMENT_UNKNOWN
@@ -71,20 +81,35 @@ docker compose ps          # wait until both are "healthy"
 - Kafka 4.1 (`apache/kafka`, single node, KRaft — no ZooKeeper) on `localhost:9092`. Topic auto-creation is off; the
   services create `marketplace.order-events` and `marketplace.order-events.DLT` (3 partitions each) at startup.
 
+### Secrets and security settings
+
+| Variable | Used by | Local default | Meaning |
+|---|---|---|---|
+| `PAYMENT_SERVICE_TOKEN` | marketplace-service, payment-service | `dev-only-payment-service-token` | shared bearer token marketplace → payment-service (same value in both) |
+| `ORDER_ACTIVITY_API_TOKEN` | order-activity-service | `dev-only-order-activity-token` | bearer token for its internal HTTP API |
+| `SESSION_COOKIE_SECURE` | marketplace-service | `true` | `Secure` flag of the session cookie; set `false` for plain-HTTP local development |
+| `SESSION_TIMEOUT` | marketplace-service | `30m` | idle timeout of the server-side session |
+| `APP_CORS_ALLOWED_ORIGINS` | marketplace-service | `http://localhost:5173` | exact origins allowed to call the API with cookies (comma-separated, never `*`) |
+
+The `dev-only-…` defaults exist only so that the lab starts without setup; the services log a warning when they are
+used. Any shared or deployed environment must set real secrets. Production traffic is expected behind HTTPS (TLS
+terminated at a load balancer or in the service), with `SESSION_COOKIE_SECURE=true`.
+
 ### 2. Run payment-service (Kotlin, port 8081)
 
 ```bash
 cd payment-service
-mvn spring-boot:run
+mvn spring-boot:run          # optionally PAYMENT_SERVICE_TOKEN=... (must match the marketplace)
 ```
 
-In-memory, no database. `PAYMENT_SLOW_DELAY` (default `5s`) controls the slow scenarios.
+In-memory, no database. `PAYMENT_SLOW_DELAY` (default `5s`) controls the slow scenarios. Every `/api/` call needs
+`Authorization: Bearer <PAYMENT_SERVICE_TOKEN>`.
 
 ### 3. Run marketplace-service (Java, port 8080)
 
 ```bash
 cd marketplace-service
-mvn spring-boot:run
+SESSION_COOKIE_SECURE=false mvn spring-boot:run     # plain HTTP locally
 ```
 
 - API: http://localhost:8080/api/products
@@ -111,7 +136,8 @@ ORDER_ACTIVITY_SIMULATION_ENABLED=true mvn spring-boot:run
 ```
 
 Consumes `marketplace.order-events` and keeps its own projection in the `order_activity` schema (own tables, own
-Flyway history). `GET http://localhost:8082/api/order-activity/{orderId}` shows the current status and the event history.
+Flyway history). `GET http://localhost:8082/api/order-activity/{orderId}` (with
+`Authorization: Bearer <ORDER_ACTIVITY_API_TOKEN>`) shows the current status and the event history.
 
 ### 5. Run the frontend
 
@@ -121,8 +147,10 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173. The Vite dev server proxies `/api` to `localhost:8080`. In dev mode the cart shows a
-"Payment scenario (dev)" select; it only has an effect when marketplace-service forwards the scenario header.
+Open http://localhost:5173. The Vite dev server proxies `/api` to `localhost:8080` (same origin for the browser, so
+the session and CSRF cookies just work). The catalog is visible without login; register or log in to use the cart.
+A page reload keeps you logged in (the app asks `/api/auth/me`). In dev mode the cart shows a "Payment scenario (dev)"
+select; it only has an effect when marketplace-service forwards the scenario header.
 
 ## Running tests
 
@@ -155,16 +183,22 @@ npm run build
 
 ## Trying the API by hand
 
-Cart, checkout and order endpoints need an `X-Session-Id` header containing any UUID.
-Checkout also needs an `Idempotency-Key` UUID; sending the same key again returns the same order.
+curl plays the browser: a cookie jar keeps `MARKETPLACE_SESSION` and `XSRF-TOKEN`, and every POST/PUT/DELETE copies
+the CSRF cookie into the `X-XSRF-TOKEN` header. Checkout also needs an `Idempotency-Key` UUID; sending the same key
+again returns the same order. (Marketplace started with `SESSION_COOKIE_SECURE=false` for plain HTTP.)
 
 ```bash
-S=$(uuidgen); K=$(uuidgen)
-curl -s -H "X-Session-Id: $S" -H "Content-Type: application/json" \
+J=/tmp/jar.txt; rm -f $J; K=$(uuidgen)
+csrf() { curl -s -o /dev/null -b $J -c $J localhost:8080/api/auth/csrf; awk '$6=="XSRF-TOKEN"{print $7}' $J; }
+curl -s -b $J -c $J -H "X-XSRF-TOKEN: $(csrf)" -H "Content-Type: application/json" \
+     -d '{"email":"me@example.com","password":"correct horse battery"}' localhost:8080/api/auth/register
+T=$(csrf)   # login/registration replaces the CSRF token
+curl -s -b $J -c $J -H "X-XSRF-TOKEN: $T" -H "Content-Type: application/json" \
      -d '{"productId":1,"quantity":2}' localhost:8080/api/cart/items
-curl -s -X POST -H "X-Session-Id: $S" -H "Idempotency-Key: $K" localhost:8080/api/checkout   # 201, status PAID
-curl -s -X POST -H "X-Session-Id: $S" -H "Idempotency-Key: $K" localhost:8080/api/checkout   # 200, same order
-curl -s -H "X-Session-Id: $S" localhost:8080/api/orders
+curl -s -b $J -c $J -X POST -H "X-XSRF-TOKEN: $T" -H "Idempotency-Key: $K" localhost:8080/api/checkout   # 201, PAID
+curl -s -b $J -c $J -X POST -H "X-XSRF-TOKEN: $T" -H "Idempotency-Key: $K" localhost:8080/api/checkout   # 200, same order
+curl -s -b $J localhost:8080/api/orders
+curl -s -b $J -c $J -X POST -H "X-XSRF-TOKEN: $T" localhost:8080/api/auth/logout                         # 204
 ```
 
 Payment scenarios (marketplace started with `PAYMENT_FORWARD_SCENARIO_HEADER=true`): add
@@ -180,8 +214,8 @@ Payment scenarios (marketplace started with `PAYMENT_FORWARD_SCENARIO_HEADER=tru
 | `SLOW` | `PAYMENT_UNKNOWN`; reconcile at once → unchanged, reconcile after ~5 s → `PAID` |
 
 ```bash
-curl -s -X POST -H "X-Session-Id: $S" localhost:8080/api/orders/<orderId>/reconcile-payment
-curl -s localhost:8081/api/payments/by-idempotency-key/<paymentKey>
+curl -s -b $J -X POST -H "X-XSRF-TOKEN: $T" localhost:8080/api/orders/<orderId>/reconcile-payment
+curl -s -H "Authorization: Bearer dev-only-payment-service-token" localhost:8081/api/payments/by-idempotency-key/<paymentKey>
 ```
 
 Several `SERVER_ERROR` checkouts in a row open the circuit breaker: for 15 s every checkout fails fast
@@ -200,7 +234,7 @@ docker exec marketplace-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstr
   --property print.offset=true --property print.headers=true
 
 # the consumer's view (eventually consistent)
-curl -s localhost:8082/api/order-activity/<orderId>
+curl -s -H "Authorization: Bearer dev-only-order-activity-token" localhost:8082/api/order-activity/<orderId>
 
 # dead-letter topic
 docker exec marketplace-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
@@ -211,10 +245,10 @@ Failure demos (order-activity-service started with `ORDER_ACTIVITY_SIMULATION_EN
 
 ```bash
 # the next OrderPaid fails twice (transient) -> retried -> processed
-curl -X POST -H "Content-Type: application/json" -d '{"match":"OrderPaid","mode":"TRANSIENT","times":2}' \
+curl -X POST -H "Authorization: Bearer dev-only-order-activity-token" -H "Content-Type: application/json" -d '{"match":"OrderPaid","mode":"TRANSIENT","times":2}' \
   localhost:8082/api/simulation/failures
 # the next OrderPaid fails permanently -> dead-letter topic
-curl -X POST -H "Content-Type: application/json" -d '{"match":"OrderPaid","mode":"PERMANENT"}' \
+curl -X POST -H "Authorization: Bearer dev-only-order-activity-token" -H "Content-Type: application/json" -d '{"match":"OrderPaid","mode":"PERMANENT"}' \
   localhost:8082/api/simulation/failures
 # replay an already published event (= crash after send, before mark): the consumer ignores the duplicate
 docker exec marketplace-postgres psql -U marketplace -c \
@@ -238,12 +272,13 @@ On Windows Git Bash, prefix `docker exec … /opt/kafka/…` commands with `MSYS
 ├── marketplace-service/        Spring Boot 4 / Java 25 backend
 │   └── src/main/java/pl/dch/marketplace/
 │       ├── product/            catalog (entity, read API)
-│       ├── cart/               anonymous cart (aggregate + API)
+│       ├── auth/               users, login/register/logout, Spring Security config, CSRF/CORS, JSON 401/403
 │       ├── checkout/           checkout orchestration, transactions 1 and 2, reconciliation
 │       ├── order/              orders (payment state machine), immutable order lines, order events
 │       ├── outbox/             transactional outbox: writer, JDBC repository, polling publisher, Kafka sender
 │       ├── payment/            payment-service HTTP client: timeouts, retry, circuit breaker
-│       ├── session/            X-Session-Id → SessionId (the one place to swap for real auth later)
+│       ├── cart/               cart of the logged-in user (aggregate + API)
+│       ├── session/            SessionId (owner key) resolved from the authenticated principal
 │       └── common/             error codes and the global API error format
 ├── payment-service/            Spring Boot 4 / Kotlin simulated payment provider
 │   └── src/main/kotlin/pl/dch/payment/
@@ -259,8 +294,8 @@ On Windows Git Bash, prefix `docker exec … /opt/kafka/…` commands with `MSYS
 │       └── api/                read-only projection API
 └── marketplace-web/            React 19 + TypeScript + Vite frontend
     └── src/
-        ├── api/                typed fetch client and DTO types
+        ├── api/                typed fetch client (cookies, CSRF header, 401 handling) and DTO types
         ├── components/         ProductList, CartPanel, OrderConfirmation, ErrorMessage
-        ├── session.ts          anonymous session UUID in localStorage
+        ├── components/AuthPanel.tsx  login / create account
         └── App.tsx             top-level state (cart, view, checkout attempt key)
 ```

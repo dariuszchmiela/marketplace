@@ -1,6 +1,6 @@
 # Interview map
 
-Where each interview topic can be demonstrated in the **current** code (Phases 1–4).
+Where each interview topic can be demonstrated in the **current** code (Phases 1–5).
 Topics for later phases are listed at the bottom as planned only. They have no code yet.
 
 Paths are relative to `marketplace-service/src/main/java/pl/dch/marketplace/` (backend),
@@ -31,7 +31,7 @@ and `marketplace-web/src/` (frontend) unless stated otherwise. Test-only paths (
 | N+1 queries | `CartRepository.findBySessionId`, `OrderRepository` (`@EntityGraph`) | Fetching children together with the parent; alternatives (JOIN FETCH, batch size). |
 | Schema migrations | `resources/db/migration/V1__…`, `V2__…`, `V3__payment_integration.sql`, `ddl-auto: validate` | Flyway vs `ddl-auto=update`, never editing applied migrations, unique and `CHECK` constraints as the last line of defence, why no FK on `cart_item.product_id`. |
 | Dependency injection | every service/controller | Constructor injection only, no field injection, easy unit testing without Spring. |
-| Replaceable boundary | `session/SessionIdArgumentResolver` | One place to swap anonymous session for real auth; an abstraction with a concrete reason. |
+| Replaceable boundary | `session/SessionIdArgumentResolver` | Built in Phase 1 as the one place to swap the anonymous header for real auth — in Phase 5 only this class changed (principal instead of header); an abstraction that paid off. |
 | Testing strategy | `src/test/java/...` | Mockito unit tests for rules; Testcontainers + real PostgreSQL for persistence/API; context caching shares one container; a real local HTTP server (`payment/FakePaymentServer`) instead of mocking the HTTP client. |
 
 ## Distributed systems / resilience (Phase 2)
@@ -103,6 +103,30 @@ Marketplace paths are under `marketplace-service/src/main/java/pl/dch/marketplac
 | Eventual consistency | tests `OutboxSchedulingIntegrationTest`, `OrderActivityConsumerIntegrationTest.eventuallyBuildsTheProjectionFromOrderCreated` (Awaitility); `api/OrderActivityController` | Write completes without waiting for Kafka/consumer; the read model lags (404 = not seen yet); bounded waiting in tests instead of sleeps. |
 | Deterministic failure injection | consumer `simulation/FailureSimulator` (+ `SimulationController`, dev only); broken publishers built from real parts in `OutboxPublisherIntegrationTest` | Test hooks outside business logic; failing after the writes proves the rollback. |
 
+## Security (Phase 5)
+
+Marketplace paths under `marketplace-service/src/main/java/pl/dch/marketplace/`; tests under
+`marketplace-service/src/test/java/pl/dch/marketplace/auth/`.
+
+| Topic | Where | What to talk about |
+|---|---|---|
+| Authentication vs authorization | `auth/SecurityConfiguration.apiSecurity` (who must be logged in), `session/SessionIdArgumentResolver` + owner-scoped repository queries (what they may access) | 401 = unknown caller, 403 = known but not allowed (or CSRF), 404 for someone else's order (don't leak existence). Tests: `AuthorizationIntegrationTest`. |
+| Password hashing | `auth/UserRegistrationService`, `SecurityConfiguration.passwordEncoder` (BCrypt), `auth/AppUserDetailsService` + `DaoAuthenticationProvider` | Salted slow hash, `matches` instead of comparing hashes, 72-byte BCrypt limit, dummy hash for unknown users (timing), same 401 for unknown email and wrong password. Tests: `AuthenticationIntegrationTest`. |
+| Server-side session | `auth/AuthController.establishSession`, `auth/AuthenticatedUser` (serializable principal, `getName()` = user id) | What is in the session and what is not (no hash, no email as principal name); no DB lookup per request; revocation = delete. |
+| JDBC Spring Session | `db/migration/V6__spring_session.sql`, `spring.session.*` in `application.yaml`; `SessionLifecycleIntegrationTest` | Sessions shared by all instances, Flyway-owned schema, timeout, expiry cleanup; sticky sessions not needed. |
+| Secure cookie | `SecurityConfiguration.sessionCookieSerializer`, `app.security.session-cookie` | HttpOnly, SameSite=Lax, Secure (configurable for local HTTP), Path; why the explicit bean was needed (the default was a cookie named `SESSION` without our settings — found by a test). |
+| Session fixation | `SecurityConfiguration.sessionAuthenticationStrategy` (`ChangeSessionIdAuthenticationStrategy`); tests `loginReplacesTheSessionIdSessionFixationProtection`, `aSessionIdChosenByAnAttackerIsNeverAdopted` | Attacker plants/knows a session id before login; a new id after login makes it useless. |
+| Logout and expiry | `AuthController.logout` (`SecurityContextLogoutHandler`, `CsrfLogoutHandler`); tests `logoutInvalidates…`, `anExpiredSessionIsRejected` | Server-side invalidation vs "delete the JWT in the browser". |
+| CSRF — why it matters with cookies | `SecurityConfiguration.apiSecurity` (`csrf.spa()` + `CookieCsrfTokenRepository`), `auth/AuthController.csrf`; `CsrfIntegrationTest` | Cookies are sent automatically, also on forged cross-site requests; double-submit token (cookie → header); login CSRF; why stateless double-submit relies on attackers not writing our cookies (cookie tossing, `__Host-`). |
+| Why bearer-header APIs differ | `payment/PaymentClientConfiguration` (service token header), payment-service `security/ServiceTokenFilter.kt` | Headers are not attached by the browser → no CSRF; the risk moves to token theft/storage. |
+| CORS and the same-origin policy | `SecurityConfiguration.corsConfigurationSource`, `AppSecurityProperties.Cors` (rejects `*`); `CorsAndHeadersIntegrationTest`; `marketplace-web/vite.config.ts` (proxy) | SOP restricts reading responses; CORS relaxes it for listed origins; credentials forbid `*`; CORS ≠ CSRF protection. |
+| User resource isolation | `SessionIdArgumentResolver` (no header fallback), `OrderRepository.findByIdAndSessionId`, `CartRepository.findBySessionId*`; tests `cartsAreIsolatedBetweenUsers`, `anotherUsersOrderIsNotFoundRatherThanForbidden`, `theLegacyXSessionIdHeaderGrantsNothing`, `theSameIdempotencyKeyOfTwoUsersCreatesTwoIndependentOrders` | Never trust a client-supplied owner id (IDOR); idempotency keys scoped per owner. |
+| Security error model | `auth/SecurityErrorHandler` (entry point + access denied handler), `common/ErrorCode`, `GlobalExceptionHandler.statusFor` | JSON instead of HTML/redirects; separate `CSRF_FAILED` so clients can recover. |
+| Service-to-service authentication | payment-service `security/ServiceTokenFilter.kt` (`MessageDigest.isEqual`), order-activity `security/InternalApiTokenFilter`; `PaymentClientTest.everyPaymentAndReconciliationCallCarriesTheServiceToken`, `ServiceTokenIntegrationTest`, `InternalApiSecurityIntegrationTest` | Shared secret: simple but no per-caller identity, manual rotation, needs TLS; alternatives mTLS, workload identity, OAuth2 client credentials. Separate secrets per boundary. |
+| JWT vs server-side session | `docs/architecture.md` → Security | Revocation, storage (XSS vs CSRF), scaling, where each fits; why a second auth mode was not added. |
+| Secrets and logging | `PaymentClientProperties.toString`, Kotlin `ServiceSecurityProperties.toString`, `CredentialsRequest.toString`, `auth.*`/`security.*` log lines; `OutputCaptureExtension` assertions | Never log passwords, hashes, cookies, CSRF or service tokens; user id instead of email. |
+| Kafka security boundary | `docker-compose.yml` (PLAINTEXT), `docs/architecture.md` → Kafka security boundary | Not implemented locally on purpose; production: TLS + SASL/workload identity + ACLs per service (produce vs consume vs DLT). |
+
 ## Frontend
 
 | Topic | Where | What to talk about |
@@ -115,7 +139,8 @@ Marketplace paths are under `marketplace-service/src/main/java/pl/dch/marketplac
 | Handling a concurrency conflict | `App.tsx` (`STOCK_CHANGED_CODES`, `catalogVersion` key remounting `ProductList`) | 409 `CONCURRENT_STOCK_CHANGE`: show the message, reload cart and catalog, retry as a new attempt (definitive rejection) — unlike ambiguous 5xx. |
 | Rendering async results | `components/OrderConfirmation.tsx` | Paid / declined / technical failure / "Payment status is being verified." + reconciliation button; exhaustive `switch` over a string union. |
 | API error handling | `api/client.ts` | Typed `ApiError`, backend error body vs non-JSON error vs network failure, user-readable messages. |
-| Session identity in the browser | `session.ts` | `crypto.randomUUID`, `localStorage` failure fallback, validating stored data. |
+| Auth state in the browser | `App.tsx` (`auth` state, `/api/auth/me` on start, `onUnauthorized`), `components/AuthPanel.tsx` | Nothing in `localStorage`: the HttpOnly cookie is invisible to JS; restoring a session = asking the server; clearing the password from state; 401 → logged-out view. Tests: `App.test.tsx`. |
+| Centralized CSRF handling | `api/client.ts` (`readCsrfToken`, `refreshCsrfToken`, `request`) | Copy cookie → header for unsafe methods only, fetch token when missing, one retry on `CSRF_FAILED`, `credentials: 'include'`. Tests: `api/client.test.ts`. |
 | TypeScript contracts | `api/types.ts` | Mirroring backend DTOs; nullable fields for missing products. |
 | Dev proxy vs CORS | `vite.config.ts` | Why no CORS config is needed in dev; what changes when frontend and API are on different origins. |
 
@@ -129,5 +154,4 @@ Listed only to show where they will attach. Nothing below is implemented.
 | Server-side retry of optimistic conflicts, conditional atomic stock update, stock reservation | not planned yet (alternatives documented in architecture.md) |
 | JMM details (happens-before, `volatile`, safe publication) beyond what the lab uses | later |
 | Kafka-based payment commands, sagas, CDC / Debezium, Schema Registry | not planned yet |
-| Authentication, authorization, sessions vs JWT, CORS/CSRF | Phase 5: replaces `SessionIdArgumentResolver` |
 | Heap, GC, connection pool diagnostics | Phase 6 |

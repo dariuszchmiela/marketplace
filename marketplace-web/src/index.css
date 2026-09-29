@@ -211,3 +211,25 @@ input[type='number'] {
 .status-pending {
   color: var(--warning);
 }
+
+.auth-form {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.auth-form label {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.auth-form input {
+  font: inherit;
+  padding: 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.auth-actions {
+  display: flex;
+  gap: 0.5rem;
+}

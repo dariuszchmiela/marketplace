@@ -28,7 +28,7 @@ class OutboxSchedulingIntegrationTest extends IntegrationTestBase {
     @Test
     void scheduledPublisherEventuallyPublishesTheEventsOfACommittedCheckout() throws Exception {
         Product lamp = createProduct("Scheduled Lamp", "10.00", 5);
-        addToCart(session, lamp.getId(), 1);
+        addToCart(user, lamp.getId(), 1);
         try (TopicReader reader = new TopicReader(String.join(",", kafka.getBootstrapServers()), "marketplace.order-events")) {
 
             String body = mockMvc.perform(checkout()).andReturn().getResponse().getContentAsString();

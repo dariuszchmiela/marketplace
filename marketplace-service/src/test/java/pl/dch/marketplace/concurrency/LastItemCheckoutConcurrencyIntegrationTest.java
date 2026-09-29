@@ -2,7 +2,6 @@ package pl.dch.marketplace.concurrency;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -29,8 +28,8 @@ class LastItemCheckoutConcurrencyIntegrationTest extends IntegrationTestBase {
     void twoShoppersBuyingTheLastUnitAtTheSameTimeExactlyOneWins() throws Exception {
         Product lamp = createProduct("Last Lamp", "10.00", 1);
         long versionBefore = versionOf(lamp);
-        String shopperA = UUID.randomUUID().toString();
-        String shopperB = UUID.randomUUID().toString();
+        TestUser shopperA = signUp();
+        TestUser shopperB = signUp();
         addToCart(shopperA, lamp.getId(), 1);
         addToCart(shopperB, lamp.getId(), 1);
 
@@ -60,10 +59,10 @@ class LastItemCheckoutConcurrencyIntegrationTest extends IntegrationTestBase {
         assertThat(jdbcTemplate.queryForObject(
                 "select count(*) from order_line where product_id = ?", Integer.class, lamp.getId())).isEqualTo(1);
         // The loser's transaction was rolled back completely: no order, cart unchanged.
-        String loserSession = loser == results.get(0) ? shopperA : shopperB;
-        mockMvc.perform(get("/api/cart").header(SESSION_HEADER, loserSession))
+        TestUser loserUser = loser == results.get(0) ? shopperA : shopperB;
+        mockMvc.perform(as(loserUser, get("/api/cart")))
                 .andExpect(jsonPath("$.items", hasSize(1)));
-        mockMvc.perform(get("/api/orders").header(SESSION_HEADER, loserSession))
+        mockMvc.perform(as(loserUser, get("/api/orders")))
                 .andExpect(jsonPath("$", hasSize(0)));
     }
 
@@ -72,16 +71,16 @@ class LastItemCheckoutConcurrencyIntegrationTest extends IntegrationTestBase {
         int stock = 3;
         int shoppers = 10;
         Product lamp = createProduct("Contested Lamp", "10.00", stock);
-        List<String> sessions = new ArrayList<>();
+        List<TestUser> sessions = new ArrayList<>();
         for (int i = 0; i < shoppers; i++) {
-            String shopper = UUID.randomUUID().toString();
+            TestUser shopper = signUp();
             addToCart(shopper, lamp.getId(), 1);
             sessions.add(shopper);
         }
 
         CountDownLatch start = new CountDownLatch(1);
         List<Future<MvcResult>> checkouts = new ArrayList<>();
-        for (String shopper : sessions) {
+        for (TestUser shopper : sessions) {
             checkouts.add(inBackground(() -> {
                 start.await();
                 return mockMvc.perform(checkoutAs(shopper)).andReturn();

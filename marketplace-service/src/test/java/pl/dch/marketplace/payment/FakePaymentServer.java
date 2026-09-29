@@ -35,6 +35,9 @@ public final class FakePaymentServer implements AutoCloseable {
 
     private static final JsonMapper JSON = JsonMapper.builder().build();
 
+    /** The service token the fake expects in {@code Authorization: Bearer …}; the tests configure the client with it. */
+    public static final String SERVICE_TOKEN = "test-payment-service-token";
+
     public record RecordedRequest(String method, String path, Map<String, String> headers, String body) {
 
         public String header(String name) {
@@ -171,6 +174,11 @@ public final class FakePaymentServer implements AutoCloseable {
     private void handle(HttpExchange exchange) throws IOException {
         try (exchange) {
             RecordedRequest request = record(exchange);
+            // Like the real payment-service: no valid service token, no access.
+            if (!("Bearer " + SERVICE_TOKEN).equals(request.header("Authorization"))) {
+                send(exchange, 401, "{\"code\":\"INVALID_SERVICE_TOKEN\"}");
+                return;
+            }
             if (request.method().equals("POST") && request.path().equals("/api/payments")) {
                 handlePost(exchange, request);
             } else if (request.method().equals("GET") && request.path().startsWith("/api/payments/by-idempotency-key/")) {

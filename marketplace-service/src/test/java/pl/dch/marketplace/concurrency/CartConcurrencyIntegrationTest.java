@@ -28,7 +28,7 @@ class CartConcurrencyIntegrationTest extends IntegrationTestBase {
     @Test
     void concurrentAddsOfTheSameProductAreNotLost() throws Exception {
         Product lamp = createProduct("Tabs Lamp", "10.00", 100);
-        addToCart(session, lamp.getId(), 1);
+        addToCart(user, lamp.getId(), 1);
 
         List<MvcResult> results = runTogether(10, () -> mockMvc.perform(
                 postWithSession("/api/cart/items", addItemJson(lamp.getId(), 1))).andReturn());
@@ -53,7 +53,7 @@ class CartConcurrencyIntegrationTest extends IntegrationTestBase {
     @Test
     void paymentFailureRestoresItemsWhileTheShopperAddsTheSameProduct() throws Exception {
         Product lamp = createProduct("Restore Lamp", "10.00", 10);
-        addToCart(session, lamp.getId(), 2);
+        addToCart(user, lamp.getId(), 2);
         AtomicReference<RowLockHolder> cartLock = new AtomicReference<>();
         CountDownLatch cartLocked = new CountDownLatch(1);
         PAYMENT_SERVICE.respondWith(decline());
@@ -84,7 +84,7 @@ class CartConcurrencyIntegrationTest extends IntegrationTestBase {
     void paymentFailureRestoreAndARemovalOfTheSameProductBothApplyCleanly() throws Exception {
         Product lamp = createProduct("Remove Lamp", "10.00", 10);
         Product mouse = createProduct("Remove Mouse", "5.00", 10);
-        addToCart(session, lamp.getId(), 2);
+        addToCart(user, lamp.getId(), 2);
         AtomicReference<RowLockHolder> cartLock = new AtomicReference<>();
         CountDownLatch cartLocked = new CountDownLatch(1);
         PAYMENT_SERVICE.respondWith(decline());

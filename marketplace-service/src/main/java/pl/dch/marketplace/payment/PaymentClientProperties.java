@@ -7,6 +7,7 @@ import jakarta.validation.Valid;
 import jakarta.validation.constraints.DecimalMax;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.validation.annotation.Validated;
@@ -26,8 +27,17 @@ public record PaymentClientProperties(
         /* Dev/test only: pass the client's X-Payment-Scenario header on to payment-service. */
         boolean forwardScenarioHeader,
         @NotNull @Valid Retry retry,
-        @NotNull @Valid CircuitBreaker circuitBreaker
+        @NotNull @Valid CircuitBreaker circuitBreaker,
+        /* Shared secret sent as "Authorization: Bearer ..." to payment-service (PAYMENT_SERVICE_TOKEN). */
+        @NotBlank String serviceToken
 ) {
+
+    /** Never print the service token (e.g. when the configuration is logged or shown in a failure analysis). */
+    @Override
+    public String toString() {
+        return "PaymentClientProperties[baseUrl=" + baseUrl + ", connectTimeout=" + connectTimeout
+                + ", readTimeout=" + readTimeout + ", serviceToken=***]";
+    }
 
     public record Retry(
             /* Total attempts including the first one. */

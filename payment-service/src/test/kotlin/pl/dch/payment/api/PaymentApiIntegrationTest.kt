@@ -25,7 +25,7 @@ import tools.jackson.databind.json.JsonMapper
  */
 @SpringBootTest(
     webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-    properties = ["payment.simulation.slow-delay=400ms"],
+    properties = ["payment.simulation.slow-delay=400ms", "payment.security.service-token=${PaymentApiIntegrationTest.TOKEN}"],
 )
 class PaymentApiIntegrationTest {
 
@@ -44,7 +44,9 @@ class PaymentApiIntegrationTest {
 
     @BeforeEach
     fun setUp() {
-        client = RestClient.create("http://localhost:$port")
+        client = RestClient.builder().baseUrl("http://localhost:$port")
+            .defaultHeader("Authorization", "Bearer $TOKEN")
+            .build()
     }
 
     @Test
@@ -202,4 +204,8 @@ class PaymentApiIntegrationTest {
 
     private fun paymentJson(orderId: Long = 1, amount: String = "10.00", key: String) =
         """{"orderId": $orderId, "amount": ${BigDecimal(amount)}, "currency": "PLN", "idempotencyKey": "$key"}"""
+
+    companion object {
+        const val TOKEN = "test-service-token"
+    }
 }

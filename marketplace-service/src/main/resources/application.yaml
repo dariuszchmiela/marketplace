@@ -17,6 +17,12 @@ spring:
     open-in-view: false
   flyway:
     enabled: true
+  session:
+    # Server-side sessions in PostgreSQL (Spring Session JDBC): every instance sees the same sessions, and logout or
+    # expiry deletes them for good. The tables come from Flyway (V6), not from runtime DDL.
+    timeout: ${SESSION_TIMEOUT:30m}
+    jdbc:
+      initialize-schema: never
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
@@ -49,6 +55,9 @@ payment:
     # Dev/test only: forwards the client's X-Payment-Scenario header to payment-service.
     # Never enable in a real deployment: it lets callers control the payment provider's behaviour.
     forward-scenario-header: ${PAYMENT_FORWARD_SCENARIO_HEADER:false}
+    # Shared secret for payment-service (Authorization: Bearer). The default is for LOCAL DEVELOPMENT ONLY and must be
+    # overridden with PAYMENT_SERVICE_TOKEN anywhere else; payment-service uses the same variable.
+    service-token: ${PAYMENT_SERVICE_TOKEN:dev-only-payment-service-token}
     retry:
       # Worst case with retries: 3 attempts, waits of ~200ms and ~400ms (+/- 50% jitter).
       max-attempts: 3
@@ -83,3 +92,16 @@ logging:
   level:
     # The Kafka clients log their complete configuration at INFO on every start.
     org.apache.kafka: WARN
+
+app:
+  security:
+    session-cookie:
+      # The only authentication credential in the browser; always HttpOnly (JavaScript and XSS cannot read it), path /.
+      name: MARKETPLACE_SESSION
+      # Secure by default: production is expected behind HTTPS. Plain-HTTP local development: SESSION_COOKIE_SECURE=false
+      # (most browsers also accept Secure cookies on http://localhost).
+      secure: ${SESSION_COOKIE_SECURE:true}
+      same-site: Lax
+    cors:
+      # Exact origins only (credentials are allowed, so never "*"). Comma-separated.
+      allowed-origins: ${APP_CORS_ALLOWED_ORIGINS:http://localhost:5173}

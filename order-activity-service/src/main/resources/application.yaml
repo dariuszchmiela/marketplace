@@ -49,6 +49,10 @@ order-activity:
   simulation:
     # Dev/test only: enables POST /api/simulation/failures to make the next matching events fail.
     enabled: ${ORDER_ACTIVITY_SIMULATION_ENABLED:false}
+  security:
+    # Every /api/ call (projection read, simulation) needs "Authorization: Bearer <token>". Separate secret from the
+    # payment token. The default is for LOCAL DEVELOPMENT ONLY (a warning is logged); set ORDER_ACTIVITY_API_TOKEN elsewhere.
+    api-token: ${ORDER_ACTIVITY_API_TOKEN:dev-only-order-activity-token}
 
 logging:
   level:

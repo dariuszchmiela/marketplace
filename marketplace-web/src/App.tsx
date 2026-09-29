@@ -1,12 +1,16 @@
 import { useEffect, useRef, useState } from 'react'
-import { api, ApiError, errorMessage, isAbortError } from './api/client'
-import type { Cart, Order } from './api/types'
+import { api, ApiError, errorMessage, isAbortError, onUnauthorized } from './api/client'
+import type { Cart, Order, User } from './api/types'
+import { AuthPanel } from './components/AuthPanel'
 import { CartPanel } from './components/CartPanel'
 import { ErrorMessage } from './components/ErrorMessage'
 import { OrderConfirmation } from './components/OrderConfirmation'
 import { ProductList } from './components/ProductList'
 
 type View = { kind: 'shop' } | { kind: 'confirmation'; order: Order }
+
+/** Who is using the app. 'loading' = asking the backend whether the session cookie is still valid. */
+type Auth = { status: 'loading' } | { status: 'anonymous' } | { status: 'authenticated'; user: User }
 
 /**
  * Whether a failed checkout request may have reached the backend without us seeing the answer
@@ -22,6 +26,8 @@ function mayHaveBeenProcessed(error: unknown): boolean {
 const STOCK_CHANGED_CODES = new Set(['CONCURRENT_STOCK_CHANGE', 'INSUFFICIENT_STOCK', 'PRODUCT_UNAVAILABLE'])
 
 export function App() {
+  const [auth, setAuth] = useState<Auth>({ status: 'loading' })
+  const [authNotice, setAuthNotice] = useState<string | null>(null)
   const [view, setView] = useState<View>({ kind: 'shop' })
   // The cart lives here because both the product list (add) and the cart panel use it.
   // It is always replaced with the backend's response - never recalculated locally.
@@ -32,8 +38,43 @@ export function App() {
   const checkoutAttemptKey = useRef<string | null>(null)
   // Changing the key remounts the product list, which reloads the catalog (stock numbers).
   const [catalogVersion, setCatalogVersion] = useState(0)
+  const userId = auth.status === 'authenticated' ? auth.user.id : null
 
+  function becomeAnonymous(notice: string | null) {
+    setAuth({ status: 'anonymous' })
+    setAuthNotice(notice)
+    setCart(null)
+    setCartError(null)
+    setView({ kind: 'shop' })
+    checkoutAttemptKey.current = null
+  }
+
+  // Restore the session after a page reload: the browser still has the HttpOnly session cookie (if any);
+  // /api/auth/me tells whether it is valid.
   useEffect(() => {
+    const controller = new AbortController()
+    api
+      .me(controller.signal)
+      .then((user) => setAuth({ status: 'authenticated', user }))
+      .catch((error: unknown) => {
+        if (!isAbortError(error)) {
+          setAuth({ status: 'anonymous' })
+        }
+      })
+    return () => controller.abort()
+  }, [])
+
+  // Any 401 later on (session expired or logged out in another tab) returns to the logged-out state.
+  useEffect(() => {
+    onUnauthorized(() => becomeAnonymous('Your session has ended. Please log in again.'))
+    return () => onUnauthorized(null)
+  }, [])
+
+  // The cart belongs to the logged-in user: load it whenever the user changes.
+  useEffect(() => {
+    if (userId === null) {
+      return
+    }
     const controller = new AbortController()
     api
       .getCart(controller.signal)
@@ -44,7 +85,27 @@ export function App() {
         }
       })
     return () => controller.abort()
-  }, [])
+  }, [userId])
+
+  async function login(email: string, password: string) {
+    const user = await api.login(email, password)
+    setAuthNotice(null)
+    setAuth({ status: 'authenticated', user })
+  }
+
+  async function register(email: string, password: string) {
+    const user = await api.register(email, password)
+    setAuthNotice(null)
+    setAuth({ status: 'authenticated', user })
+  }
+
+  async function logout() {
+    try {
+      await api.logout()
+    } finally {
+      becomeAnonymous(null)
+    }
+  }
 
   async function refreshCart() {
     try {
@@ -103,12 +164,17 @@ export function App() {
     <div className="app">
       <header className="app-header">
         <h1>Marketplace Interview Lab</h1>
-        <span className="muted">
-          {itemCount} item{itemCount === 1 ? '' : 's'} in cart
-        </span>
+        {auth.status === 'authenticated' && (
+          <span className="muted">
+            {itemCount} item{itemCount === 1 ? '' : 's'} in cart · {auth.user.email}{' '}
+            <button type="button" className="link-button" onClick={() => void logout()}>
+              Log out
+            </button>
+          </span>
+        )}
       </header>
 
-      {view.kind === 'confirmation' ? (
+      {view.kind === 'confirmation' && auth.status === 'authenticated' ? (
         <OrderConfirmation
           order={view.order}
           onCheckPaymentStatus={checkPaymentStatus}
@@ -116,12 +182,18 @@ export function App() {
         />
       ) : (
         <main className="shop">
-          <ProductList key={catalogVersion} onAddToCart={addToCart} />
+          <ProductList key={catalogVersion} onAddToCart={addToCart} canAddToCart={auth.status === 'authenticated'} />
           <aside>
-            {cartError && <ErrorMessage message={cartError} />}
-            {!cart && !cartError && <p className="muted">Loading cart…</p>}
-            {cart && (
-              <CartPanel cart={cart} onUpdateQuantity={updateQuantity} onRemove={removeItem} onCheckout={checkout} />
+            {auth.status === 'loading' && <p className="muted">Loading…</p>}
+            {auth.status === 'anonymous' && <AuthPanel onLogin={login} onRegister={register} notice={authNotice} />}
+            {auth.status === 'authenticated' && (
+              <>
+                {cartError && <ErrorMessage message={cartError} />}
+                {!cart && !cartError && <p className="muted">Loading cart…</p>}
+                {cart && (
+                  <CartPanel cart={cart} onUpdateQuantity={updateQuantity} onRemove={removeItem} onCheckout={checkout} />
+                )}
+              </>
             )}
           </aside>
         </main>

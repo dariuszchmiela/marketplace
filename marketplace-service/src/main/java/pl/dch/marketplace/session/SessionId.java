@@ -4,12 +4,12 @@ import java.util.Objects;
 import java.util.UUID;
 
 /**
- * Identifies the anonymous shopper who owns a cart and orders.
+ * Identifies the owner of a cart and of orders (the {@code session_id} column of those tables).
  * <p>
- * Phase 1 has no authentication: the browser generates a UUID, keeps it in local storage
- * and sends it as the {@value SessionIdArgumentResolver#HEADER_NAME} header. Controllers only
- * depend on this type, so replacing the header with a real authenticated identity later
- * means changing {@link SessionIdArgumentResolver} rather than every endpoint.
+ * Since Phase 5 it is the authenticated user's {@code app_user.shopping_session_id}, resolved from the principal by
+ * {@link SessionIdArgumentResolver}. (Phases 1–4 let the browser choose it via an {@code X-Session-Id} header; that
+ * header no longer exists.) Controllers and services only depend on this type, so the switch to real authentication
+ * changed the resolver, not the endpoints.
  */
 public record SessionId(UUID value) {
 

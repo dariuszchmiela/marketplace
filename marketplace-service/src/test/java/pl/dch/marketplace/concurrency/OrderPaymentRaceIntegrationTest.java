@@ -74,7 +74,7 @@ class OrderPaymentRaceIntegrationTest extends IntegrationTestBase {
     @Test
     void checkoutResultAndReconciliationArrivingTogetherOverHttpCompensateOnce() throws Exception {
         Product lamp = createProduct("Double Result Lamp", "10.00", INITIAL_STOCK);
-        addToCart(session, lamp.getId(), ORDERED);
+        addToCart(user, lamp.getId(), ORDERED);
         PAYMENT_SERVICE.respondWith(decline());
         AtomicReference<RowLockHolder> orderLock = new AtomicReference<>();
         AtomicReference<Long> orderId = new AtomicReference<>();
@@ -102,7 +102,7 @@ class OrderPaymentRaceIntegrationTest extends IntegrationTestBase {
     @Test
     void noRowLockOrTransactionIsHeldWhilePaymentServiceIsCalled() throws Exception {
         Product lamp = createProduct("Lock Free Lamp", "10.00", INITIAL_STOCK);
-        addToCart(session, lamp.getId(), 1);
+        addToCart(user, lamp.getId(), 1);
         PAYMENT_SERVICE.respondWith(fail(500));   // -> PAYMENT_UNKNOWN, then reconcile
         List<String> lockedDuringRemoteCall = new CopyOnWriteArrayList<>();
         PAYMENT_SERVICE.beforePostHandling(request -> {
@@ -144,7 +144,7 @@ class OrderPaymentRaceIntegrationTest extends IntegrationTestBase {
 
     /** An order waiting for its result: stock taken, cart emptied. */
     private long unknownOrder(Product product) throws Exception {
-        addToCart(session, product.getId(), ORDERED);
+        addToCart(user, product.getId(), ORDERED);
         PAYMENT_SERVICE.respondWith(fail(500));
         MvcResult result = mockMvc.perform(checkout()).andReturn();
         assertThat(status(result)).isEqualTo("PAYMENT_UNKNOWN");

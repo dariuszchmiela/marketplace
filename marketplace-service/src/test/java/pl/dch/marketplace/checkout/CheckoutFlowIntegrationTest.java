@@ -1,6 +1,5 @@
 package pl.dch.marketplace.checkout;
 
-import java.util.UUID;
 
 import com.jayway.jsonpath.JsonPath;
 import org.junit.jupiter.api.Test;
@@ -126,7 +125,7 @@ class CheckoutFlowIntegrationTest extends IntegrationTestBase {
     }
 
     @Test
-    void ordersAreVisibleOnlyToTheSessionThatCreatedThem() throws Exception {
+    void ordersAreVisibleOnlyToTheUserWhoCreatedThem() throws Exception {
         Product lamp = createProduct("Private Lamp", "10.00", 5);
         mockMvc.perform(postWithSession("/api/cart/items", addItemJson(lamp.getId(), 1)))
                 .andExpect(status().isOk());
@@ -135,11 +134,11 @@ class CheckoutFlowIntegrationTest extends IntegrationTestBase {
                 .andReturn();
         long orderId = ((Number) JsonPath.read(checkout.getResponse().getContentAsString(), "$.id")).longValue();
 
-        String otherSession = UUID.randomUUID().toString();
-        mockMvc.perform(get("/api/orders/{id}", orderId).header(SESSION_HEADER, otherSession))
+        TestUser otherUser = signUp();
+        mockMvc.perform(as(otherUser, get("/api/orders/{id}", orderId)))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value("ORDER_NOT_FOUND"));
-        mockMvc.perform(get("/api/orders").header(SESSION_HEADER, otherSession))
+        mockMvc.perform(as(otherUser, get("/api/orders")))
                 .andExpect(jsonPath("$", hasSize(0)));
     }
 }

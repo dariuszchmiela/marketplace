@@ -56,6 +56,8 @@ class PaymentClientConfiguration {
                 .baseUrl(properties.baseUrl().toString())
                 .requestFactory(requestFactory)
                 .defaultHeader(HttpHeaders.ACCEPT, MediaType.APPLICATION_JSON_VALUE)
+                // Service-to-service authentication: every payment and reconciliation call carries the shared token.
+                .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + properties.serviceToken())
                 .build();
     }
 

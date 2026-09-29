@@ -6,9 +6,11 @@ import { ErrorMessage } from './ErrorMessage'
 
 interface ProductListProps {
   onAddToCart: (productId: number) => Promise<void>
+  /** false while logged out: the catalog stays browsable, adding to a cart needs an account */
+  canAddToCart?: boolean
 }
 
-export function ProductList({ onAddToCart }: ProductListProps) {
+export function ProductList({ onAddToCart, canAddToCart = true }: ProductListProps) {
   const [products, setProducts] = useState<Product[]>([])
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -82,9 +84,9 @@ export function ProductList({ onAddToCart }: ProductListProps) {
             <button
               type="button"
               onClick={() => handleAdd(product.id)}
-              disabled={product.availableQuantity === 0 || addingProductId !== null}
+              disabled={!canAddToCart || product.availableQuantity === 0 || addingProductId !== null}
             >
-              {addingProductId === product.id ? 'Adding…' : 'Add to cart'}
+              {!canAddToCart ? 'Log in to buy' : addingProductId === product.id ? 'Adding…' : 'Add to cart'}
             </button>
           </li>
         ))}

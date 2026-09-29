@@ -1,16 +1,16 @@
-# Architecture (Phase 4)
+# Architecture (Phase 5)
 
 ## Overview
 
 ```text
 Browser (React, Vite dev server :5173)
-   │  fetch /api/*  + X-Session-Id: <uuid from localStorage>
-   │                + Idempotency-Key: <uuid per checkout attempt>   (checkout only)
+   │  fetch /api/*  + cookies MARKETPLACE_SESSION (HttpOnly) and XSRF-TOKEN
+   │                + X-XSRF-TOKEN header on POST/PUT/DELETE, Idempotency-Key on checkout
    ▼
-Vite proxy ──► marketplace-service (Java, Spring Boot, :8080) ──HTTP──► payment-service (Kotlin, Spring Boot, :8081)
+Vite proxy ──► marketplace-service (Java, Spring Boot, :8080) ──HTTP + Bearer service token──► payment-service (Kotlin, :8081)
                   │  Spring Data JPA / Hibernate                           in-memory payments (Phase 2 simplification)
                   ▼
-               PostgreSQL public schema (orders, …, outbox_event)
+               PostgreSQL public schema (app_user, spring_session, orders, …, outbox_event)
                   │  outbox publisher (polling)
                   ▼
                Kafka  marketplace.order-events (3 partitions, key = orderId)
@@ -21,12 +21,13 @@ Vite proxy ──► marketplace-service (Java, Spring Boot, :8080) ──HTTP�
 ```
 
 Three backend services and one frontend. The frontend uses only the synchronous marketplace API; the event path is
-downstream of it and never on a user request path. No authentication yet.
+downstream of it and never on a user request path. Users authenticate with a server-side session (Phase 5).
 
 ## Backend: `marketplace-service`
 
 Java 25, Spring Boot 4.1 (Spring Framework 7, Hibernate 7), Spring Web MVC, Spring Data JPA,
-Bean Validation, Flyway, springdoc-openapi, Resilience4j 2.4 (core modules only). No Lombok.
+Bean Validation, Flyway, springdoc-openapi, Resilience4j 2.4 (core modules only), Spring Security 7, Spring Session JDBC.
+No Lombok.
 
 ### Packages (package-by-feature)
 
@@ -38,23 +39,32 @@ Bean Validation, Flyway, springdoc-openapi, Resilience4j 2.4 (core modules only)
 | `order` | `Order` (payment state machine) + immutable `OrderLine`, read API scoped to the session; `order.events`: order integration events written to the outbox |
 | `payment` | HTTP client for payment-service: timeouts, retry, circuit breaker, outcome classification |
 | `outbox` | transactional outbox: `OutboxWriter` (same transaction), `OutboxRepository` (JDBC, SKIP LOCKED claim), `OutboxPublisher` (polling), `KafkaEventSender` |
-| `session` | `SessionId` value + argument resolver reading `X-Session-Id` |
+| `auth` | users (`app_user`), registration, JSON login/logout/me, Spring Security configuration (session, CSRF, CORS, JSON 401/403) |
+| `session` | `SessionId` (owner key of carts and orders) + argument resolver taking it from the authenticated principal |
 | `common` | `ErrorCode`, `MarketplaceException`, `ApiError`, `GlobalExceptionHandler` |
 
 ### API
+
+Everything except the catalog, `/api/auth/csrf`, register and login requires a login (session cookie); all POST/PUT/DELETE
+require the CSRF header.
 
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/api/products` | ordered by id, no pagination (small seeded catalog) |
 | GET | `/api/products/{id}` | 404 `PRODUCT_NOT_FOUND` |
-| GET | `/api/cart` | returns an empty cart if the session has none (nothing persisted on read) |
+| GET | `/api/auth/csrf` | public; sets the readable `XSRF-TOKEN` cookie |
+| POST | `/api/auth/register` | public + CSRF; `{email, password}` → 201 `{id, email}`, logged in; 409 `EMAIL_ALREADY_REGISTERED` |
+| POST | `/api/auth/login` | public + CSRF; → 200 `{id, email}`, new session id; 401 `INVALID_CREDENTIALS` |
+| POST | `/api/auth/logout` | login + CSRF; 204, session deleted |
+| GET | `/api/auth/me` | login; `{id, email}` (restores the UI after a reload) |
+| GET | `/api/cart` | returns an empty cart if the user has none (nothing persisted on read) |
 | POST | `/api/cart/items` | `{productId, quantity}`; adds to an existing line if the product is already in the cart |
 | PUT | `/api/cart/items/{productId}` | `{quantity}` sets the absolute quantity (≥ 1) |
 | DELETE | `/api/cart/items/{productId}` | idempotent, removing a missing line is not an error |
 | POST | `/api/checkout` | requires `Idempotency-Key: <uuid>`; 201 (created) or 200 (replay) + `Location` + order |
 | POST | `/api/orders/{id}/reconcile-payment` | asks payment-service for the result of an open payment; returns the order |
-| GET | `/api/orders` | orders of the current session, newest first |
-| GET | `/api/orders/{id}` | 404 if the order belongs to another session |
+| GET | `/api/orders` | orders of the logged-in user, newest first |
+| GET | `/api/orders/{id}` | 404 if the order belongs to another user |
 
 Contract decisions:
 
@@ -91,10 +101,10 @@ place (`GlobalExceptionHandler.statusFor`). Validation/header problems → 400 (
 empty cart → 422, `PAYMENT_SERVICE_UNAVAILABLE` (reconciliation could not reach payment-service) → 503,
 anything unexpected → 500. payment-service uses the same body shape.
 
-### Anonymous session
+### Users and ownership
 
-The browser generates a UUID once, stores it in `localStorage` and sends it as `X-Session-Id`.
-`SessionIdArgumentResolver` converts it into a `SessionId` parameter. This is identification, not security.
+See **Security (Phase 5)** below. Carts and orders are owned by the authenticated user (`app_user.shopping_session_id`
+= the existing `session_id` columns); the browser never sends an owner id.
 
 ## payment-service (Kotlin)
 
@@ -542,10 +552,153 @@ or 404. If Kafka is down, the lag grows until it is back; nothing is lost. The f
 `event.stale`, `event.processed`, `event.retry`, `event.failed permanent=true`, `event.dead_lettered` — all with eventId,
 eventType and order id, no payload bodies.
 
+## Security (Phase 5)
+
+### Authentication vs authorization
+
+- **Authentication** — *who are you?* Email + password once (`POST /api/auth/login` or `/register`), then a
+  server-side session identified by the `MARKETPLACE_SESSION` cookie. No/expired session → **401**.
+- **Authorization** — *what may you do?* Here it is resource ownership: a cart or order is accessible only to its owner.
+  Every repository query is scoped by the owner key from the authenticated principal. Someone else's order → **404**
+  (not 403: do not even confirm that order #42 exists). Authenticated but not allowed (e.g. wrong/missing CSRF token) → **403**.
+
+### One authentication model: server-side session (not JWT)
+
+Spring Security + **Spring Session JDBC** (sessions in PostgreSQL) + an **HttpOnly cookie**.
+
+| | Server-side session (chosen) | JWT access token |
+|---|---|---|
+| Where state lives | `SPRING_SESSION` table; cookie holds only a random id | self-contained signed token in the client |
+| Logout / revocation | delete the row — immediate | token valid until expiry unless a denylist (= server state again) |
+| Browser storage | HttpOnly cookie: unreadable by JavaScript/XSS | often `localStorage` (readable by XSS) or a cookie (then CSRF anyway) |
+| CSRF | needed (cookie sent automatically) — implemented | not needed for `Authorization: Bearer` headers (not sent automatically) |
+| Scaling | shared store needed (here PostgreSQL; every instance reads it) | stateless verification, good across many services/domains |
+| Fits | one browser app + its own backend | APIs for third parties, mobile, service chains, federated identity |
+
+For one browser SPA talking to its own backend, the session is simpler and safer (instant logout, no token in JS). JWT was
+not added "because it is popular": a second auth path would double the attack surface and the tests without solving a
+problem this system has. The internal service-to-service calls use a bearer header (see below), which is where bearer
+tokens make sense.
+
+### User model (`V5__app_user.sql`, `auth/AppUser`)
+
+`app_user(id identity, email unique + CHECK normalized, password_hash, shopping_session_id UUID unique, created_at)`.
+- Email normalized (trim + lower case, `auth/EmailAddress`) before validation, on register and login; the DB constraint
+  rejects any non-normalized value.
+- Password: `@Size(min = 8, max = 72)` and at most **72 bytes** (BCrypt ignores anything longer —
+  `UserRegistrationService.MAX_PASSWORD_BYTES`), hashed with **BCrypt** (`BCryptPasswordEncoder`, cost 10, salted);
+  verified only via `PasswordEncoder.matches` (inside `DaoAuthenticationProvider`). Hash never in DTOs, logs or the session.
+- **`shopping_session_id`** is the owner key the cart and order tables already use (`session_id` columns). It is a random
+  UUID created once per user, stable across logins, never sent to the browser. So **no cart/order migration** was needed;
+  `SessionId` and all services stay unchanged — only `session/SessionIdArgumentResolver` now takes it from the principal.
+
+### The principal and the removed `X-Session-Id`
+
+`auth/AuthenticatedUser(userId, email, shoppingSessionId)` is stored in the session (Serializable, no hash; `getName()`
+= user id, so `SPRING_SESSION.PRINCIPAL_NAME` and logs hold no email). No user lookup per request.
+Phases 1–4 let the browser choose the owner id (`X-Session-Id`) — anyone who knew or guessed it owned that cart. The header
+is gone everywhere (resolver, OpenAPI, frontend, tests) and there is **no fallback**: an anonymous request with a victim's
+owner key gets 401, a logged-in user sending it simply sees their own data (`AuthorizationIntegrationTest.theLegacyXSessionIdHeaderGrantsNothing`).
+
+### Sessions (`V6__spring_session.sql`) and the cookie
+
+- Spring Session JDBC with Flyway-owned tables (`spring.session.jdbc.initialize-schema: never`); any marketplace instance
+  reads the same sessions. Idle timeout `spring.session.timeout` (`SESSION_TIMEOUT`, default 30 min; tests prove the
+  configured value is applied); Spring Session deletes expired sessions.
+- Cookie (`SecurityConfiguration.sessionCookieSerializer`, explicit — Spring Session's default would be a cookie named
+  `SESSION` without our settings): `MARKETPLACE_SESSION`, `HttpOnly`, `SameSite=Lax`, `Path=/`, `Secure` configurable
+  (`SESSION_COOKIE_SECURE`, default **true**; `false` only for plain-HTTP local development). Production is expected behind
+  HTTPS/TLS.
+- **Session fixation**: after login/registration `ChangeSessionIdAuthenticationStrategy` gives the session a new id; an id
+  known before login (planted by an attacker) is worthless afterwards (tests: id changes, old id → 401; a planted cookie is
+  never adopted).
+- **Logout** (`POST /api/auth/logout`, needs CSRF): `SecurityContextLogoutHandler` invalidates the session → the row is
+  deleted; the old cookie no longer authenticates (tested, also in the smoke test). **Expiry**: an idle session is rejected
+  (tested by moving `last_access_time` back).
+
+### CSRF
+
+With cookie authentication the browser attaches the session cookie to every request to our site — also to a request a
+malicious page triggers (form POST, `fetch` with credentials). CSRF protection makes such forged requests fail:
+- `CookieCsrfTokenRepository` (via `csrf.spa()`): token in the **readable** `XSRF-TOKEN` cookie (`SameSite=Lax`, `Path=/`);
+  the SPA copies it into the **`X-XSRF-TOKEN` header** on POST/PUT/DELETE. Another site can make the browser *send* our
+  cookies but cannot *read* them, so it cannot set the header. The session cookie itself stays HttpOnly.
+- All unsafe methods need it — including **login and register** (login CSRF: a foreign page logging the victim into the
+  attacker's account) and logout. GET/HEAD/OPTIONS don't. `GET /api/auth/csrf` makes sure the cookie exists.
+- Login/registration clear the token (`CsrfAuthenticationStrategy`); the client fetches a fresh one. This repository is the
+  **stateless double-submit** pattern: the server only checks header == cookie and keeps no copy, so "rotation" means the
+  browser drops the cookie. It relies on attackers being unable to write our cookies; a compromised subdomain could
+  ("cookie tossing") — mitigations would be a `__Host-` cookie prefix (requires HTTPS) or a session-bound token repository.
+- **Why bearer-header APIs differ**: an `Authorization: Bearer` header is never added by the browser automatically, so a
+  pure header-token API is not CSRF-prone (its risk is token theft, e.g. from `localStorage` via XSS).
+- Missing/wrong token → **403 `CSRF_FAILED`**; the frontend then refreshes the token and retries once.
+
+### CORS and the same-origin policy
+
+The browser's same-origin policy stops JavaScript of origin A from reading responses of origin B. In development the Vite
+proxy makes the API same-origin, so CORS is not even needed. For a frontend on another origin, CORS
+(`SecurityConfiguration.corsConfigurationSource`) allows only `APP_CORS_ALLOWED_ORIGINS` (default `http://localhost:5173`),
+with `allowCredentials=true` — therefore the origin is echoed exactly and `*` is rejected at startup; allowed methods
+GET/POST/PUT/DELETE/OPTIONS and headers `Content-Type`, `Accept`, `X-XSRF-TOKEN`, `Idempotency-Key`, `X-Payment-Scenario`.
+Unknown origin → 403, no `Access-Control-Allow-Origin` (tested). CORS is not CSRF protection: CORS controls who may *read*
+responses; a forged form POST needs no CORS at all — that is what the CSRF token is for.
+
+### Error model and headers
+
+`auth/SecurityErrorHandler` writes the normal `ApiError` JSON for Spring Security failures — no HTML, no redirect:
+`401 AUTHENTICATION_REQUIRED`, `401 INVALID_CREDENTIALS` (identical for unknown email and wrong password;
+`DaoAuthenticationProvider` also hashes a dummy password for unknown users so timing does not tell), `403 ACCESS_DENIED`,
+`403 CSRF_FAILED`, `409 EMAIL_ALREADY_REGISTERED`, `400 INVALID_PASSWORD`/`VALIDATION_FAILED`.
+Spring Security's default headers are kept: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+`Cache-Control: no-cache, no-store` (authenticated JSON must not be cached by shared caches), HSTS only on HTTPS requests.
+No CSP: the backend serves JSON only; the frontend is served separately. Swagger UI / OpenAPI stay public in this training
+project (they contain no data).
+
+### Logging
+
+`auth.registered userId=…`, `auth.login_succeeded userId=…`, `auth.login_failed reason=…` (no email), `auth.logout
+userId=…`, `security.authentication_required path=…`, `security.access_denied userId=… path=…`,
+`security.csrf_rejected userId=… path=…`, `security.service_auth_failed code=…` (payment-service),
+`security.internal_api_auth_failed` (order-activity-service). Never logged: passwords, hashes, session cookies, CSRF tokens,
+service tokens, `Authorization` headers (tests capture the log output and check for the password; the smoke-test logs
+were scanned for all of them).
+
+### Service-to-service authentication
+
+- **marketplace → payment-service**: `PaymentClient` sends `Authorization: Bearer <PAYMENT_SERVICE_TOKEN>` on every
+  payment POST (including retries) and reconciliation GET; payment-service's `security/ServiceTokenFilter` rejects a
+  missing or wrong token with JSON 401 (`MISSING_SERVICE_TOKEN` / `INVALID_SERVICE_TOKEN`), comparing in constant time
+  (`MessageDigest.isEqual`). A 401 is a 4xx: the marketplace treats it as "not processed" (no retry, order fails, nothing
+  charged). Retry, idempotency and reconciliation are unchanged.
+- **order-activity-service**: its HTTP API (projection read, dev-only simulation) requires `Authorization: Bearer
+  <ORDER_ACTIVITY_API_TOKEN>` — a different secret. The simulation controller still exists only with
+  `order-activity.simulation.enabled=true`, and even then never anonymously (tested). The Kafka consumer is unaffected.
+- Both tokens have `dev-only-…` defaults for local startup (a warning is logged); real environments set the variables.
+- **Limits of a shared secret**: no identity per caller, manual rotation (both sides at once), leaks via config/logs,
+  replayable if intercepted without TLS. Real systems use mTLS, workload identity (e.g. SPIFFE, cloud IAM), or OAuth2
+  client credentials with short-lived tokens — deliberately not built here.
+
+### Kafka security boundary (not implemented)
+
+The local Kafka runs PLAINTEXT, single broker, **no authentication, no TLS, no ACLs — not production-safe**. Anyone who
+can reach port 9092 can read or write order events. Production Kafka would use TLS + SASL (SCRAM/OAUTHBEARER) or workload
+identity, and ACLs such as: marketplace-service may *produce* to `marketplace.order-events`; order-activity-service may
+*consume* it (group `order-activity-service`) and *produce* to `marketplace.order-events.DLT`. Standard
+`spring.kafka.security.*` / `spring.kafka.properties.sasl.*` properties could be supplied via environment, but nothing
+of that is configured or tested here.
+
 ## Frontend: `marketplace-web`
 
 React 19 + TypeScript + Vite, plain CSS, no UI framework, no router, no global state library.
 
+- **Authentication**: `App.tsx` keeps `auth` state (`loading` / `anonymous` / `authenticated`). On start it calls
+  `/api/auth/me` — the browser still has the HttpOnly session cookie after a reload, so a valid session is restored.
+  Logged out: catalog visible, "Log in to buy", `components/AuthPanel` (login / create account; the password is cleared
+  from state after every submit). Any 401 `AUTHENTICATION_REQUIRED` (expired session) returns to the logged-out view.
+  Nothing about the login is stored in `localStorage`; the old `session.ts` (random `X-Session-Id`) is deleted.
+- **CSRF** is centralized in `api/client.ts`: unsafe requests read the `XSRF-TOKEN` cookie (fetching `/api/auth/csrf`
+  first if it is missing, e.g. after login) and send `X-XSRF-TOKEN`; a `403 CSRF_FAILED` triggers one token refresh + retry.
+  All requests use `credentials: 'include'`.
 - `App.tsx` owns the cart and the current view. It keeps the **checkout attempt key** in a `useRef`: created on
   the first click of an attempt, reused when the request failed in a way that may have reached the backend
   (network error, 5xx), cleared after an order came back or the backend rejected the request (4xx).
@@ -571,17 +724,28 @@ lock scope), `common/ConcurrencyErrorMappingTest`, the training lab in `lab/`, a
 workers, head of line; `OutboxSchedulingIntegrationTest`: the scheduled publisher; `OutboxWriterTest`: serialization).
 All integration tests share one PostgreSQL and one Kafka container (Testcontainers, `apache/kafka:4.1.1`).
 
+Phase 5 security tests in `auth/` (real security chain via `TestBrowser`, a cookie jar that copies the CSRF cookie into
+the header like the SPA): `AuthenticationIntegrationTest` (register, normalization, hash, cookie flags, duplicate email,
+login, identical failures, validation, no secrets in logs), `SessionLifecycleIntegrationTest` (JDBC session, timeout,
+logout, fixation, planted id, CSRF reset, expiry), `CsrfIntegrationTest`, `AuthorizationIntegrationTest` (public catalog,
+401s, `X-Session-Id` ignored, cart/order isolation, same idempotency key for two users, no owner key in responses),
+`CorsAndHeadersIntegrationTest`. All older integration tests now sign up a real user per test.
+
 order-activity-service (`mvn test`): `OrderEventParserTest` (contract, tolerant reader, malformed/unsupported),
 `OrderActivityConsumerIntegrationTest` (real Kafka + PostgreSQL: eventual projection, ordering, duplicate delivery,
 transient retry with rollback, exhausted retries → DLT and continue, malformed/unsupported/impossible transition → DLT,
 stale replay ignored).
 
 payment-service (`mvn test`): `PaymentServiceTest` (idempotency incl. 32 concurrent threads), `ScenarioSimulatorTest`,
-`PaymentApiIntegrationTest` (real HTTP on a random port: every scenario, 16 concurrent HTTP requests with one key).
+`PaymentApiIntegrationTest` (real HTTP on a random port: every scenario, 16 concurrent HTTP requests with one key),
+`ServiceTokenIntegrationTest` (missing/wrong/right token, lookups protected, token not logged). order-activity-service also has
+`InternalApiSecurityIntegrationTest`.
 
 Frontend (`npm test`, Vitest + Testing Library): idempotency key reuse per attempt, one request per double click,
 rendering of paid/declined/technical failure/unknown, reconciliation button, reload + new attempt after
-`CONCURRENT_STOCK_CHANGE`.
+`CONCURRENT_STOCK_CHANGE`. Phase 5: CSRF header on unsafe calls (login, logout, cart, checkout), token fetch when missing,
+retry after `CSRF_FAILED`, no `X-Session-Id`, credentials included, logged-out view, login (password cleared), register,
+session restore via `/me`, logout, 401 → logged-out view.
 
 ## Not implemented yet (deliberately)
 
@@ -597,6 +761,7 @@ rendering of paid/declined/technical failure/unknown, reconciliation button, rel
 - **DLT handling:** records in `marketplace.order-events.DLT` are only stored; no replay tool or alerting.
 - **Stock reservation / server-side retry of optimistic conflicts:** a conflicting buyer gets 409 and must retry, even
   when enough units were left (false conflict on a hot product). See Concurrency for the alternatives.
-- **Security:** no users, authentication or service-to-service auth; `X-Session-Id` is a bearer identifier only.
+- **Security extras:** no login rate limiting / account lockout, no password reset or email verification, no MFA, no
+  OAuth/external IdP, no roles beyond "user", no Kafka authentication/ACLs, no mTLS between services (see Security).
 - **Operations:** no metrics, tracing, Actuator/health checks, containerized services or deployment.
 - Catalog management, pagination, stock reservation with expiry, multiple currencies, taxes, shipping.

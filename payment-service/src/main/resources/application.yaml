@@ -12,3 +12,7 @@ payment:
     enabled: ${PAYMENT_SIMULATION_ENABLED:true}
     # Must be longer than marketplace-service's payment.client.read-timeout (2s) to cause a timeout.
     slow-delay: ${PAYMENT_SLOW_DELAY:5s}
+  security:
+    # Shared secret the marketplace sends as "Authorization: Bearer ...". The default is for LOCAL DEVELOPMENT ONLY
+    # (a warning is logged when it is used); any shared/deployed environment sets PAYMENT_SERVICE_TOKEN.
+    service-token: ${PAYMENT_SERVICE_TOKEN:dev-only-payment-service-token}
