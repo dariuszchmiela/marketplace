@@ -58,3 +58,42 @@ describe('CartPanel checkout', () => {
     expect((screen.getByRole('button', { name: 'Checkout' }) as HTMLButtonElement).disabled).toBe(false)
   })
 })
+
+describe('CartPanel quantity input', () => {
+  afterEach(cleanup)
+
+  function withQuantity(quantity: number): Cart {
+    const [item] = cart.items
+    return { items: [{ ...item, quantity, lineTotal: item.unitPrice! * quantity }], total: item.unitPrice! * quantity }
+  }
+
+  function panel(current: Cart) {
+    return <CartPanel cart={current} onUpdateQuantity={vi.fn()} onRemove={vi.fn()} onCheckout={vi.fn()} />
+  }
+
+  function quantityInput() {
+    return screen.getByRole('spinbutton', { name: 'Quantity of Keyboard' }) as HTMLInputElement
+  }
+
+  it('shows the quantity returned by the backend without remounting the row', () => {
+    const { rerender } = render(panel(withQuantity(2)))
+    const input = quantityInput()
+    fireEvent.change(input, { target: { value: '7' } })
+
+    rerender(panel(withQuantity(3)))
+
+    // Same DOM node (stable key), but the draft follows the new backend quantity.
+    expect(quantityInput()).toBe(input)
+    expect(input.value).toBe('3')
+  })
+
+  it('keeps the typed draft when the backend quantity has not changed', () => {
+    const { rerender } = render(panel(withQuantity(2)))
+    fireEvent.change(quantityInput(), { target: { value: '5' } })
+
+    rerender(panel(withQuantity(2)))
+
+    expect(quantityInput().value).toBe('5')
+    expect((screen.getByRole('button', { name: 'Update' }) as HTMLButtonElement).disabled).toBe(false)
+  })
+})

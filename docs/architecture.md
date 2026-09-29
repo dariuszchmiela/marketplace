@@ -57,7 +57,10 @@ Contract decisions:
 - **Checkout has no request body.** It always checks out the session's current cart.
 - **Money is `BigDecimal` / `NUMERIC(12,2)`, serialized as JSON numbers.** A single currency (PLN) is
   assumed and not modelled. The frontend only formats backend-computed amounts; it does no arithmetic.
-- Quantities are limited to 1–1000 per request (Bean Validation) to keep values sane.
+- **A cart line quantity is always 1–1000** (`CartItem.MAX_QUANTITY`). This is a domain invariant, checked
+  on creating a line, changing its quantity and adding to it, so repeated additions cannot exceed it either
+  (the sum is computed as `long`, no int overflow). Exceeding it returns `400 INVALID_QUANTITY`. The request
+  DTOs reuse the same constant in `@Max` for early Bean Validation feedback (`400 VALIDATION_FAILED`).
 
 ### Error model
 

@@ -45,13 +45,16 @@ class CartServiceTest {
 
     private final Product keyboard = product(1L, "Keyboard", "349.99", 10);
     private final Product mouse = product(2L, "Mouse", "129.50", 3);
+    // More stock than the cart quantity limit, so the limit (not stock) is what gets hit.
+    private final Product cable = product(3L, "Cable", "9.99", CartItem.MAX_QUANTITY * 5);
 
     @BeforeEach
     void setUp() {
         cartService = new CartService(cartRepository, productRepository);
-        List<Product> catalog = List.of(keyboard, mouse);
+        List<Product> catalog = List.of(keyboard, mouse, cable);
         when(productRepository.findById(1L)).thenReturn(Optional.of(keyboard));
         when(productRepository.findById(2L)).thenReturn(Optional.of(mouse));
+        when(productRepository.findById(3L)).thenReturn(Optional.of(cable));
         when(productRepository.findAllById(anyCollection())).thenAnswer(invocation -> {
             Collection<Long> ids = invocation.getArgument(0);
             return catalog.stream().filter(product -> ids.contains(product.getId())).toList();
@@ -115,6 +118,45 @@ class CartServiceTest {
                 .isInstanceOf(MarketplaceException.class)
                 .extracting("code").isEqualTo(ErrorCode.INVALID_QUANTITY);
         assertThat(cart.quantityOf(1L)).isEqualTo(2);
+    }
+
+    @Test
+    void acceptsMaximumQuantityWhenAddingAndUpdating() {
+        Cart cart = cartWith(3L, 1);
+
+        cartService.updateItemQuantity(SESSION, 3L, CartItem.MAX_QUANTITY);
+        assertThat(cart.quantityOf(3L)).isEqualTo(CartItem.MAX_QUANTITY);
+
+        cartService.removeItem(SESSION, 3L);
+        CartResponse response = cartService.addItem(SESSION, 3L, CartItem.MAX_QUANTITY);
+        assertThat(response.items()).singleElement()
+                .satisfies(item -> assertThat(item.quantity()).isEqualTo(CartItem.MAX_QUANTITY));
+    }
+
+    @Test
+    void rejectsQuantityAboveMaximumWhenAddingAndUpdating() {
+        Cart cart = cartWith(3L, 1);
+
+        assertThatThrownBy(() -> cartService.addItem(SESSION, 3L, CartItem.MAX_QUANTITY + 1))
+                .isInstanceOf(MarketplaceException.class)
+                .extracting("code").isEqualTo(ErrorCode.INVALID_QUANTITY);
+        assertThatThrownBy(() -> cartService.updateItemQuantity(SESSION, 3L, CartItem.MAX_QUANTITY + 1))
+                .isInstanceOf(MarketplaceException.class)
+                .extracting("code").isEqualTo(ErrorCode.INVALID_QUANTITY);
+        assertThat(cart.quantityOf(3L)).isEqualTo(1);
+    }
+
+    @Test
+    void rejectsRepeatedAdditionsThatTogetherExceedMaximumEvenWhenStockWouldAllowIt() {
+        Cart cart = cartWith(3L, 600);
+
+        cartService.addItem(SESSION, 3L, 400);
+        assertThat(cart.quantityOf(3L)).isEqualTo(CartItem.MAX_QUANTITY);
+
+        assertThatThrownBy(() -> cartService.addItem(SESSION, 3L, 1))
+                .isInstanceOf(MarketplaceException.class)
+                .extracting("code").isEqualTo(ErrorCode.INVALID_QUANTITY);
+        assertThat(cart.quantityOf(3L)).isEqualTo(CartItem.MAX_QUANTITY);
     }
 
     @Test

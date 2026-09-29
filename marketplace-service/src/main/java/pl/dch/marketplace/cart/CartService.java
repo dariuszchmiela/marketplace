@@ -43,7 +43,8 @@ public class CartService {
         Cart cart = cartRepository.findBySessionId(sessionId.value())
                 .orElseGet(() -> cartRepository.save(new Cart(sessionId.value())));
 
-        ensureStock(product, cart.quantityOf(productId) + quantity);
+        // The quantity limit is checked before stock: exceeding it is a client error, not a stock conflict.
+        ensureStock(product, cart.quantityAfterAdding(productId, quantity));
         cart.addItem(productId, quantity);
         return toResponse(cart);
     }

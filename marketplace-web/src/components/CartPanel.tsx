@@ -60,7 +60,7 @@ export function CartPanel({ cart, onUpdateQuantity, onRemove, onCheckout }: Cart
         <ul className="cart-items">
           {cart.items.map((item) => (
             <CartRow
-              key={`${item.productId}:${item.quantity}`}
+              key={item.productId}
               item={item}
               disabled={busy || checkingOut}
               onUpdate={(quantity) => runItemAction(() => onUpdateQuantity(item.productId, quantity))}
@@ -87,9 +87,15 @@ interface CartRowProps {
 }
 
 function CartRow({ item, disabled, onUpdate, onRemove }: CartRowProps) {
-  // Local draft of the input. The parent keys the row by quantity, so the draft is
-  // reset whenever the server returns a new quantity.
+  // Local draft of the input. Whenever the server returns a different quantity, the draft is
+  // reset to it. This adjusts state during render (React's recommended pattern for deriving
+  // state from a changed prop), so no stale value is ever painted.
   const [quantityInput, setQuantityInput] = useState(String(item.quantity))
+  const [syncedQuantity, setSyncedQuantity] = useState(item.quantity)
+  if (item.quantity !== syncedQuantity) {
+    setSyncedQuantity(item.quantity)
+    setQuantityInput(String(item.quantity))
+  }
 
   const parsed = Number(quantityInput)
   const isValid = Number.isInteger(parsed) && parsed >= 1

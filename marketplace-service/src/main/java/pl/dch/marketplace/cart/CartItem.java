@@ -20,6 +20,13 @@ import pl.dch.marketplace.common.MarketplaceException;
 @Table(name = "cart_item")
 public class CartItem {
 
+    /**
+     * Upper bound for the quantity of one cart line. Enforced by the domain for every resulting
+     * quantity (so repeated additions cannot exceed it) and reused by the request DTOs for early
+     * Bean Validation feedback.
+     */
+    public static final int MAX_QUANTITY = 1000;
+
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
@@ -39,22 +46,36 @@ public class CartItem {
     }
 
     CartItem(Cart cart, Long productId, int quantity) {
-        requireValidQuantity(quantity);
         this.cart = cart;
         this.productId = productId;
-        this.quantity = quantity;
+        this.quantity = requireValidQuantity(quantity);
     }
 
-    static void requireValidQuantity(int quantity) {
-        if (quantity <= 0) {
+    /**
+     * Accepts a {@code long} so that a sum of two quantities is checked before it is narrowed to {@code int}.
+     */
+    static int requireValidQuantity(long quantity) {
+        if (quantity < 1 || quantity > MAX_QUANTITY) {
             throw new MarketplaceException(ErrorCode.INVALID_QUANTITY,
-                    "Quantity must be positive, got " + quantity);
+                    "Quantity must be between 1 and %d, got %d".formatted(MAX_QUANTITY, quantity));
         }
+        return (int) quantity;
+    }
+
+    /**
+     * Validates the added quantity and the resulting sum. The sum is computed as {@code long}, so it cannot overflow.
+     */
+    static int sumQuantities(int current, int added) {
+        requireValidQuantity(added);
+        return requireValidQuantity((long) current + added);
     }
 
     void changeQuantity(int quantity) {
-        requireValidQuantity(quantity);
-        this.quantity = quantity;
+        this.quantity = requireValidQuantity(quantity);
+    }
+
+    void increaseQuantity(int added) {
+        this.quantity = sumQuantities(quantity, added);
     }
 
     public Long getProductId() {

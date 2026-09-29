@@ -3,6 +3,7 @@ package pl.dch.marketplace.common;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.MediaType;
 import pl.dch.marketplace.IntegrationTestBase;
+import pl.dch.marketplace.cart.CartItem;
 import pl.dch.marketplace.product.Product;
 
 import static org.hamcrest.Matchers.contains;
@@ -68,6 +69,30 @@ class ApiErrorIntegrationTest extends IntegrationTestBase {
         mockMvc.perform(postWithSession("/api/cart/items", addItemJson(999_999, 1)))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value("PRODUCT_NOT_FOUND"));
+    }
+
+    @Test
+    void repeatedAdditionsAboveCartQuantityLimitAreRejectedAsInvalidQuantity() throws Exception {
+        Product product = createProduct("Plentiful Lamp", "10.00", CartItem.MAX_QUANTITY * 5);
+
+        mockMvc.perform(postWithSession("/api/cart/items", addItemJson(product.getId(), CartItem.MAX_QUANTITY)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.items[0].quantity").value(CartItem.MAX_QUANTITY));
+        mockMvc.perform(postWithSession("/api/cart/items", addItemJson(product.getId(), 1)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_QUANTITY"));
+        mockMvc.perform(getWithSession("/api/cart"))
+                .andExpect(jsonPath("$.items[0].quantity").value(CartItem.MAX_QUANTITY));
+    }
+
+    @Test
+    void quantityAboveLimitInSingleRequestIsRejectedByBeanValidation() throws Exception {
+        Product product = createProduct("Bulk Lamp", "10.00", CartItem.MAX_QUANTITY * 5);
+
+        mockMvc.perform(postWithSession("/api/cart/items", addItemJson(product.getId(), CartItem.MAX_QUANTITY + 1)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.fieldErrors[0].field").value("quantity"));
     }
 
     @Test

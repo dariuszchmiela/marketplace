@@ -641,6 +641,22 @@ Claude Code przed zakończeniem bloku ma:
 
 Dopiero potem ChatGPT robi review.
 
+## Stały workflow handoff po każdym bloku Claude Code
+
+Obowiązuje po każdym bloku implementacyjnym Claude Code (wszystkie fazy, także prompty poprawkowe):
+
+1. `claude-result.md` (w root repo) jest aktualizowany finalnym raportem z bloku.
+2. Wszystkie zmiany projektu — nowe, zmodyfikowane i usunięte pliki, w tym dokumentacja i konfiguracja — są dodane do stage (`git add`).
+3. `claude-result.md` pozostaje niezastage'owany / untracked (nie trafia do commita).
+4. Claude Code NIE robi commita.
+5. Claude Code NIE robi pusha.
+6. Finalna weryfikacja obejmuje:
+   - `git status --short`,
+   - odpowiednie testy / buildy (backend, frontend),
+   - podsumowanie w `claude-result.md` (zmiany, testy, wyniki, `git status --short`, `git diff --cached --stat`).
+
+Commit wykonuje użytkownik dopiero po review.
+
 ---
 
 # 11. Czego NIE robimy na początku

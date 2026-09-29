@@ -52,14 +52,20 @@ public class Cart {
      * Adds the quantity to an existing line for the product, or creates a new line.
      */
     public void addItem(Long productId, int quantity) {
-        CartItem.requireValidQuantity(quantity);
         Optional<CartItem> existing = findItem(productId);
         if (existing.isPresent()) {
-            CartItem item = existing.get();
-            item.changeQuantity(item.getQuantity() + quantity);
+            existing.get().increaseQuantity(quantity);
         } else {
             items.add(new CartItem(this, productId, quantity));
         }
+    }
+
+    /**
+     * The line quantity {@link #addItem} would produce, validated against the same limits,
+     * without modifying the cart.
+     */
+    public int quantityAfterAdding(Long productId, int quantity) {
+        return CartItem.sumQuantities(quantityOf(productId), quantity);
     }
 
     public void changeQuantity(Long productId, int quantity) {

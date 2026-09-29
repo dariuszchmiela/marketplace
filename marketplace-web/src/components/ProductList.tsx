@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api, errorMessage, isAbortError } from '../api/client'
 import type { Product } from '../api/types'
 import { formatPrice } from '../format'
@@ -14,6 +14,9 @@ export function ProductList({ onAddToCart }: ProductListProps) {
   const [loadError, setLoadError] = useState<string | null>(null)
   const [addError, setAddError] = useState<string | null>(null)
   const [addingProductId, setAddingProductId] = useState<number | null>(null)
+  // State updates are asynchronous; the ref blocks a second add synchronously,
+  // even before React has re-rendered the buttons as disabled.
+  const addInFlight = useRef(false)
 
   // Load products when the list is shown. The AbortController cancels the request if the
   // component unmounts first (and in React StrictMode's mount/unmount/mount in development).
@@ -39,6 +42,10 @@ export function ProductList({ onAddToCart }: ProductListProps) {
   }, [])
 
   async function handleAdd(productId: number) {
+    if (addInFlight.current) {
+      return
+    }
+    addInFlight.current = true
     setAddingProductId(productId)
     setAddError(null)
     try {
@@ -46,6 +53,7 @@ export function ProductList({ onAddToCart }: ProductListProps) {
     } catch (error) {
       setAddError(errorMessage(error))
     } finally {
+      addInFlight.current = false
       setAddingProductId(null)
     }
   }
