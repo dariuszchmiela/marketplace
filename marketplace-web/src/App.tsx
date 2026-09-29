@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { api, errorMessage, isAbortError } from './api/client'
+import { useEffect, useRef, useState } from 'react'
+import { api, ApiError, errorMessage, isAbortError } from './api/client'
 import type { Cart, Order } from './api/types'
 import { CartPanel } from './components/CartPanel'
 import { ErrorMessage } from './components/ErrorMessage'
@@ -8,7 +8,14 @@ import { ProductList } from './components/ProductList'
 
 type View = { kind: 'shop' } | { kind: 'confirmation'; order: Order }
 
-const EMPTY_CART: Cart = { items: [], total: 0 }
+/**
+ * Whether a failed checkout request may have reached the backend without us seeing the answer
+ * (network error, 5xx, gateway/proxy error). Retrying it must then reuse the same idempotency key,
+ * so the backend returns the order it may already have created instead of creating a second one.
+ */
+function mayHaveBeenProcessed(error: unknown): boolean {
+  return !(error instanceof ApiError) || error.status === 0 || error.status >= 500
+}
 
 export function App() {
   const [view, setView] = useState<View>({ kind: 'shop' })
@@ -16,6 +23,9 @@ export function App() {
   // It is always replaced with the backend's response - never recalculated locally.
   const [cart, setCart] = useState<Cart | null>(null)
   const [cartError, setCartError] = useState<string | null>(null)
+  // One checkout attempt = one idempotency key. Kept in a ref: it is not rendered, and it must
+  // survive re-renders between a failed request and its retry.
+  const checkoutAttemptKey = useRef<string | null>(null)
 
   useEffect(() => {
     const controller = new AbortController()
@@ -30,6 +40,15 @@ export function App() {
     return () => controller.abort()
   }, [])
 
+  async function refreshCart() {
+    try {
+      setCart(await api.getCart())
+      setCartError(null)
+    } catch (error) {
+      setCartError(errorMessage(error))
+    }
+  }
+
   async function addToCart(productId: number) {
     setCart(await api.addToCart(productId, 1))
   }
@@ -42,11 +61,30 @@ export function App() {
     setCart(await api.removeCartItem(productId))
   }
 
-  async function checkout() {
-    const order = await api.checkout()
-    // Checkout empties the cart on the backend in the same transaction that creates the order.
-    setCart(EMPTY_CART)
+  async function checkout(paymentScenario?: string) {
+    checkoutAttemptKey.current ??= crypto.randomUUID()
+    let order: Order
+    try {
+      order = await api.checkout(checkoutAttemptKey.current, paymentScenario)
+    } catch (error) {
+      if (!mayHaveBeenProcessed(error)) {
+        // Rejected before anything happened (e.g. empty cart, stock): the next click is a new attempt.
+        checkoutAttemptKey.current = null
+      }
+      throw error
+    }
+    checkoutAttemptKey.current = null
     setView({ kind: 'confirmation', order })
+    // The backend emptied the cart, or put the items back if the payment failed.
+    await refreshCart()
+  }
+
+  async function checkPaymentStatus(orderId: number) {
+    const order = await api.reconcilePayment(orderId)
+    setView({ kind: 'confirmation', order })
+    if (order.status === 'PAYMENT_FAILED') {
+      await refreshCart()
+    }
   }
 
   const itemCount = cart?.items.reduce((sum, item) => sum + item.quantity, 0) ?? 0
@@ -61,7 +99,11 @@ export function App() {
       </header>
 
       {view.kind === 'confirmation' ? (
-        <OrderConfirmation order={view.order} onContinueShopping={() => setView({ kind: 'shop' })} />
+        <OrderConfirmation
+          order={view.order}
+          onCheckPaymentStatus={checkPaymentStatus}
+          onContinueShopping={() => setView({ kind: 'shop' })}
+        />
       ) : (
         <main className="shop">
           <ProductList onAddToCart={addToCart} />

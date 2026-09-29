@@ -78,6 +78,18 @@ class CartTest {
     }
 
     @Test
+    void restoringItemsOfAFailedOrderMergesWithTheCartAndIsCappedAtMaximum() {
+        cart.addItem(1L, MAX_QUANTITY - 3);
+
+        cart.restoreItem(1L, 5);
+        cart.restoreItem(2L, 2);
+        cart.restoreItem(1L, 1);
+
+        assertThat(cart.quantityOf(1L)).isEqualTo(MAX_QUANTITY);
+        assertThat(cart.quantityOf(2L)).isEqualTo(2);
+    }
+
+    @Test
     void quantityAfterAddingDoesNotModifyCart() {
         cart.addItem(1L, 2);
 

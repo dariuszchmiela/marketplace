@@ -44,10 +44,11 @@ class CheckoutFlowIntegrationTest extends IntegrationTestBase {
                 .andExpect(jsonPath("$.items", hasSize(2)))
                 .andExpect(jsonPath("$.total").value(1238.70));
 
-        MvcResult checkout = mockMvc.perform(postWithSession("/api/checkout", ""))
+        MvcResult checkout = mockMvc.perform(checkout())
                 .andExpect(status().isCreated())
                 .andExpect(header().exists("Location"))
-                .andExpect(jsonPath("$.status").value("NEW"))
+                .andExpect(jsonPath("$.status").value("PAID"))
+                .andExpect(jsonPath("$.paymentId").isNotEmpty())
                 .andExpect(jsonPath("$.total").value(1238.70))
                 .andExpect(jsonPath("$.lines", hasSize(2)))
                 .andExpect(jsonPath("$.lines[0].productName").value("Desk Lamp"))
@@ -76,8 +77,8 @@ class CheckoutFlowIntegrationTest extends IntegrationTestBase {
                 .andExpect(jsonPath("$.items", hasSize(0)))
                 .andExpect(jsonPath("$.total").value(0));
 
-        // A repeated checkout finds an empty cart instead of creating a second order.
-        mockMvc.perform(postWithSession("/api/checkout", ""))
+        // A new checkout attempt (new key) finds an empty cart instead of creating a second order.
+        mockMvc.perform(checkout())
                 .andExpect(status().isUnprocessableContent())
                 .andExpect(jsonPath("$.code").value("CART_EMPTY"));
     }
@@ -87,7 +88,7 @@ class CheckoutFlowIntegrationTest extends IntegrationTestBase {
         Product lamp = createProduct("Snapshot Lamp", "50.00", 5);
         mockMvc.perform(postWithSession("/api/cart/items", addItemJson(lamp.getId(), 2)))
                 .andExpect(status().isOk());
-        MvcResult checkout = mockMvc.perform(postWithSession("/api/checkout", ""))
+        MvcResult checkout = mockMvc.perform(checkout())
                 .andExpect(status().isCreated())
                 .andReturn();
         long orderId = ((Number) JsonPath.read(checkout.getResponse().getContentAsString(), "$.id")).longValue();
@@ -111,10 +112,11 @@ class CheckoutFlowIntegrationTest extends IntegrationTestBase {
         // Someone else bought chairs in the meantime: the cart is not a reservation.
         jdbcTemplate.update("UPDATE product SET available_quantity = 1 WHERE id = ?", chair.getId());
 
-        mockMvc.perform(postWithSession("/api/checkout", ""))
+        mockMvc.perform(checkout())
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("INSUFFICIENT_STOCK"));
 
+        assertThat(PAYMENT_SERVICE.postRequests()).isEmpty();
         assertThat(stockOf(lamp)).isEqualTo(5);
         assertThat(stockOf(chair)).isEqualTo(1);
         mockMvc.perform(getWithSession("/api/orders"))
@@ -128,7 +130,7 @@ class CheckoutFlowIntegrationTest extends IntegrationTestBase {
         Product lamp = createProduct("Private Lamp", "10.00", 5);
         mockMvc.perform(postWithSession("/api/cart/items", addItemJson(lamp.getId(), 1)))
                 .andExpect(status().isOk());
-        MvcResult checkout = mockMvc.perform(postWithSession("/api/checkout", ""))
+        MvcResult checkout = mockMvc.perform(checkout())
                 .andExpect(status().isCreated())
                 .andReturn();
         long orderId = ((Number) JsonPath.read(checkout.getResponse().getContentAsString(), "$.id")).longValue();

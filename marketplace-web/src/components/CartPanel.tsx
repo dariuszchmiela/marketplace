@@ -8,8 +8,19 @@ interface CartPanelProps {
   cart: Cart
   onUpdateQuantity: (productId: number, quantity: number) => Promise<void>
   onRemove: (productId: number) => Promise<void>
-  onCheckout: () => Promise<void>
+  /** paymentScenario: dev-only payment-service failure simulation, undefined for normal checkout */
+  onCheckout: (paymentScenario?: string) => Promise<void>
 }
+
+// Only honoured when marketplace-service runs with PAYMENT_FORWARD_SCENARIO_HEADER=true.
+const PAYMENT_SCENARIOS = [
+  'SUCCESS',
+  'DECLINED',
+  'SLOW',
+  'SERVER_ERROR',
+  'SERVER_ERROR_ONCE',
+  'SUCCESS_BUT_SLOW_RESPONSE',
+] as const
 
 export function CartPanel({ cart, onUpdateQuantity, onRemove, onCheckout }: CartPanelProps) {
   const [error, setError] = useState<string | null>(null)
@@ -18,6 +29,7 @@ export function CartPanel({ cart, onUpdateQuantity, onRemove, onCheckout }: Cart
   // State updates are asynchronous; the ref blocks a second checkout synchronously,
   // even before React has re-rendered the button as disabled.
   const checkoutInFlight = useRef(false)
+  const [paymentScenario, setPaymentScenario] = useState<string>('SUCCESS')
 
   async function runItemAction(action: () => Promise<void>) {
     setBusy(true)
@@ -39,7 +51,7 @@ export function CartPanel({ cart, onUpdateQuantity, onRemove, onCheckout }: Cart
     setCheckingOut(true)
     setError(null)
     try {
-      await onCheckout()
+      await onCheckout(paymentScenario === 'SUCCESS' ? undefined : paymentScenario)
     } catch (e) {
       setError(errorMessage(e))
     } finally {
@@ -72,6 +84,18 @@ export function CartPanel({ cart, onUpdateQuantity, onRemove, onCheckout }: Cart
       <p className="total">
         Total: <strong>{formatPrice(cart.total)}</strong>
       </p>
+      {import.meta.env.DEV && (
+        <label className="dev-scenario muted">
+          Payment scenario (dev):{' '}
+          <select value={paymentScenario} onChange={(event) => setPaymentScenario(event.target.value)}>
+            {PAYMENT_SCENARIOS.map((scenario) => (
+              <option key={scenario} value={scenario}>
+                {scenario}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
       <button type="button" className="primary" onClick={handleCheckout} disabled={isEmpty || busy || checkingOut}>
         {checkingOut ? 'Placing order…' : 'Checkout'}
       </button>

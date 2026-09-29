@@ -33,9 +33,16 @@ export interface OrderLine {
   lineTotal: number
 }
 
+export type OrderStatus = 'NEW' | 'PAYMENT_PENDING' | 'PAID' | 'PAYMENT_FAILED' | 'PAYMENT_UNKNOWN'
+
+/** Only set for PAYMENT_FAILED. In both cases nothing was charged. */
+export type PaymentFailureReason = 'DECLINED' | 'NOT_PROCESSED'
+
 export interface Order {
   id: number
-  status: 'NEW'
+  status: OrderStatus
+  paymentFailureReason: PaymentFailureReason | null
+  paymentId: string | null
   total: number
   createdAt: string
   lines: OrderLine[]

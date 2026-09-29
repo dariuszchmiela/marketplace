@@ -17,3 +17,28 @@ spring:
 springdoc:
   swagger-ui:
     path: /swagger-ui.html
+
+payment:
+  client:
+    base-url: ${PAYMENT_SERVICE_URL:http://localhost:8081}
+    connect-timeout: 1s
+    # Time until payment-service's response headers arrive. Longer waits are treated as "result unknown".
+    read-timeout: 2s
+    # Dev/test only: forwards the client's X-Payment-Scenario header to payment-service.
+    # Never enable in a real deployment: it lets callers control the payment provider's behaviour.
+    forward-scenario-header: ${PAYMENT_FORWARD_SCENARIO_HEADER:false}
+    retry:
+      # Worst case with retries: 3 attempts, waits of ~200ms and ~400ms (+/- 50% jitter).
+      max-attempts: 3
+      initial-backoff: 200ms
+      backoff-multiplier: 2.0
+      randomization-factor: 0.5
+    circuit-breaker:
+      # Opens when at least half of the last 10 calls failed, but not before 5 calls were recorded.
+      failure-rate-threshold: 50
+      sliding-window-size: 10
+      minimum-number-of-calls: 5
+      # While open, calls fail fast without touching payment-service. Then 2 trial calls (half-open)
+      # decide whether it closes again or reopens.
+      wait-duration-in-open-state: 15s
+      permitted-calls-in-half-open-state: 2

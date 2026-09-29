@@ -1,7 +1,7 @@
 package pl.dch.marketplace.checkout;
 
 import java.math.BigDecimal;
-import java.util.Collection;
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -9,164 +9,124 @@ import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.mockito.junit.jupiter.MockitoSettings;
-import org.mockito.quality.Strictness;
-import pl.dch.marketplace.cart.Cart;
-import pl.dch.marketplace.cart.CartRepository;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.test.util.ReflectionTestUtils;
 import pl.dch.marketplace.common.ErrorCode;
 import pl.dch.marketplace.common.MarketplaceException;
 import pl.dch.marketplace.order.Order;
-import pl.dch.marketplace.order.OrderRepository;
+import pl.dch.marketplace.order.OrderLine;
 import pl.dch.marketplace.order.OrderResponse;
-import pl.dch.marketplace.order.OrderStatus;
-import pl.dch.marketplace.product.Product;
-import pl.dch.marketplace.product.ProductRepository;
+import pl.dch.marketplace.payment.PaymentClient;
+import pl.dch.marketplace.payment.PaymentOutcome;
+import pl.dch.marketplace.payment.RemotePayment;
 import pl.dch.marketplace.session.SessionId;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyCollection;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.verify;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
-import static pl.dch.marketplace.product.TestProducts.product;
 
+/**
+ * Orchestration only; the database and HTTP behaviour are covered by the integration tests.
+ */
 @ExtendWith(MockitoExtension.class)
-@MockitoSettings(strictness = Strictness.LENIENT)
 class CheckoutServiceTest {
 
     private static final SessionId SESSION = new SessionId(UUID.randomUUID());
+    private static final UUID CHECKOUT_KEY = UUID.randomUUID();
 
     @Mock
-    private CartRepository cartRepository;
+    private OrderPlacementService orderPlacement;
 
     @Mock
-    private ProductRepository productRepository;
+    private PaymentClient paymentClient;
 
     @Mock
-    private OrderRepository orderRepository;
+    private OrderPaymentUpdater orderPaymentUpdater;
 
     private CheckoutService checkoutService;
 
-    private final Product keyboard = product(1L, "Keyboard", "349.99", 10);
-    private final Product mouse = product(2L, "Mouse", "129.50", 3);
-    private final Product cable = product(3L, "Cable", "0.10", 100);
+    private Order order;
+    private OrderResponse orderResponse;
 
     @BeforeEach
     void setUp() {
-        checkoutService = new CheckoutService(cartRepository, productRepository, orderRepository);
-        givenCatalog(keyboard, mouse, cable);
-        when(orderRepository.save(any(Order.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        order = Order.create(SESSION.value(), CHECKOUT_KEY,
+                List.of(new OrderLine(1L, "Keyboard", new BigDecimal("349.99"), 2)), Instant.now());
+        ReflectionTestUtils.setField(order, "id", 5L);
+        orderResponse = OrderResponse.from(order);
+        checkoutService = new CheckoutService(orderPlacement, paymentClient, orderPaymentUpdater);
     }
 
     @Test
-    void rejectsCheckoutWhenSessionHasNoCart() {
-        when(cartRepository.findBySessionId(SESSION.value())).thenReturn(Optional.empty());
+    void placesOrderThenPaysWithTheOrdersPaymentKeyThenAppliesTheOutcome() {
+        when(orderPlacement.placeOrder(SESSION, CHECKOUT_KEY))
+                .thenReturn(new OrderPlacementService.PlacedOrder(orderResponse, order.getPaymentIdempotencyKey(), true));
+        PaymentOutcome outcome = new PaymentOutcome.Succeeded("pay-1");
+        when(paymentClient.pay(any(), any())).thenReturn(outcome);
+        when(orderPaymentUpdater.applyOutcome(anyLong(), any())).thenReturn(orderResponse);
 
-        assertCheckoutFailsWith(ErrorCode.CART_EMPTY);
+        CheckoutService.CheckoutResult result = checkoutService.checkout(SESSION, CHECKOUT_KEY, "DECLINED");
+
+        assertThat(result.created()).isTrue();
+        InOrder steps = inOrder(orderPlacement, paymentClient, orderPaymentUpdater);
+        steps.verify(orderPlacement).placeOrder(SESSION, CHECKOUT_KEY);
+        steps.verify(paymentClient).pay(
+                new RemotePayment.Request(5L, new BigDecimal("699.98"), "PLN", order.getPaymentIdempotencyKey()),
+                "DECLINED");
+        steps.verify(orderPaymentUpdater).applyOutcome(5L, outcome);
     }
 
     @Test
-    void rejectsCheckoutOfEmptyCart() {
-        givenCart(new Cart(SESSION.value()));
+    void replayedCheckoutReturnsTheExistingOrderWithoutPayingAgain() {
+        when(orderPlacement.placeOrder(SESSION, CHECKOUT_KEY))
+                .thenReturn(new OrderPlacementService.PlacedOrder(orderResponse, order.getPaymentIdempotencyKey(), false));
 
-        assertCheckoutFailsWith(ErrorCode.CART_EMPTY);
+        CheckoutService.CheckoutResult result = checkoutService.checkout(SESSION, CHECKOUT_KEY, null);
+
+        assertThat(result.created()).isFalse();
+        assertThat(result.order()).isEqualTo(orderResponse);
+        verifyNoInteractions(paymentClient, orderPaymentUpdater);
     }
 
     @Test
-    void rejectsCheckoutWhenProductNoLongerExists() {
-        Cart cart = new Cart(SESSION.value());
-        cart.addItem(1L, 1);
-        cart.addItem(99L, 1);
-        givenCart(cart);
+    void concurrentDuplicateThatLostTheRaceReturnsTheWinnersOrder() {
+        when(orderPlacement.placeOrder(SESSION, CHECKOUT_KEY))
+                .thenThrow(new DataIntegrityViolationException("uk_orders_session_checkout_key"));
+        when(orderPlacement.findByCheckoutKey(SESSION, CHECKOUT_KEY)).thenReturn(Optional.of(orderResponse));
 
-        assertCheckoutFailsWith(ErrorCode.PRODUCT_UNAVAILABLE);
-        assertThat(keyboard.getAvailableQuantity()).isEqualTo(10);
-        assertThat(cart.isEmpty()).isFalse();
+        CheckoutService.CheckoutResult result = checkoutService.checkout(SESSION, CHECKOUT_KEY, null);
+
+        assertThat(result.created()).isFalse();
+        verifyNoInteractions(paymentClient, orderPaymentUpdater);
     }
 
     @Test
-    void rejectsCheckoutWhenStockIsInsufficientWithoutTouchingOtherProducts() {
-        Cart cart = new Cart(SESSION.value());
-        cart.addItem(1L, 2);
-        cart.addItem(2L, 4);
-        givenCart(cart);
+    void duplicateThatSawTheCartAlreadyEmptiedByTheWinnerReturnsTheWinnersOrder() {
+        // The winner committed between our key lookup and our cart read (found by the smoke test).
+        when(orderPlacement.placeOrder(SESSION, CHECKOUT_KEY))
+                .thenThrow(new MarketplaceException(ErrorCode.CART_EMPTY, "Cart is empty"));
+        when(orderPlacement.findByCheckoutKey(SESSION, CHECKOUT_KEY)).thenReturn(Optional.of(orderResponse));
 
-        assertCheckoutFailsWith(ErrorCode.INSUFFICIENT_STOCK);
-        assertThat(keyboard.getAvailableQuantity()).isEqualTo(10);
-        assertThat(mouse.getAvailableQuantity()).isEqualTo(3);
-        assertThat(cart.isEmpty()).isFalse();
+        CheckoutService.CheckoutResult result = checkoutService.checkout(SESSION, CHECKOUT_KEY, null);
+
+        assertThat(result.order()).isEqualTo(orderResponse);
+        assertThat(result.created()).isFalse();
     }
 
     @Test
-    void calculatesTotalFromCurrentBackendPricesWithExactDecimalArithmetic() {
-        Cart cart = new Cart(SESSION.value());
-        cart.addItem(1L, 2);
-        cart.addItem(2L, 3);
-        cart.addItem(3L, 3);
-        givenCart(cart);
+    void failureWithoutAnExistingOrderIsRethrown() {
+        MarketplaceException failure = new MarketplaceException(ErrorCode.CART_EMPTY, "Cart is empty");
+        when(orderPlacement.placeOrder(SESSION, CHECKOUT_KEY)).thenThrow(failure);
+        when(orderPlacement.findByCheckoutKey(SESSION, CHECKOUT_KEY)).thenReturn(Optional.empty());
 
-        OrderResponse order = checkoutService.checkout(SESSION);
-
-        // 2 * 349.99 + 3 * 129.50 + 3 * 0.10 = 699.98 + 388.50 + 0.30
-        // (with double, 3 * 0.10 would already be 0.30000000000000004)
-        assertThat(order.total()).isEqualByComparingTo("1088.78");
-        assertThat(order.lines()).extracting(OrderResponse.OrderLineResponse::lineTotal)
-                .usingElementComparator(BigDecimal::compareTo)
-                .containsExactly(new BigDecimal("699.98"),
-                        new BigDecimal("388.50"),
-                        new BigDecimal("0.30"));
-    }
-
-    @Test
-    void successfulCheckoutCreatesOrderDecreasesStockAndClearsCart() {
-        Cart cart = new Cart(SESSION.value());
-        cart.addItem(1L, 2);
-        cart.addItem(2L, 3);
-        givenCart(cart);
-
-        OrderResponse response = checkoutService.checkout(SESSION);
-
-        ArgumentCaptor<Order> saved = ArgumentCaptor.forClass(Order.class);
-        verify(orderRepository).save(saved.capture());
-        Order order = saved.getValue();
-        assertThat(order.getSessionId()).isEqualTo(SESSION.value());
-        assertThat(order.getStatus()).isEqualTo(OrderStatus.NEW);
-        assertThat(order.getLines()).hasSize(2);
-
-        assertThat(response.lines()).first().satisfies(line -> {
-            assertThat(line.productId()).isEqualTo(1L);
-            assertThat(line.productName()).isEqualTo("Keyboard");
-            assertThat(line.unitPrice()).isEqualByComparingTo("349.99");
-            assertThat(line.quantity()).isEqualTo(2);
-        });
-        assertThat(response.total()).isEqualByComparingTo("1088.48");
-
-        assertThat(keyboard.getAvailableQuantity()).isEqualTo(8);
-        assertThat(mouse.getAvailableQuantity()).isZero();
-        assertThat(cart.isEmpty()).isTrue();
-    }
-
-    private void assertCheckoutFailsWith(ErrorCode expected) {
-        assertThatThrownBy(() -> checkoutService.checkout(SESSION))
-                .isInstanceOf(MarketplaceException.class)
-                .extracting("code").isEqualTo(expected);
-        verify(orderRepository, never()).save(any());
-    }
-
-    private void givenCart(Cart cart) {
-        when(cartRepository.findBySessionId(SESSION.value())).thenReturn(Optional.of(cart));
-    }
-
-    private void givenCatalog(Product... products) {
-        List<Product> catalog = List.of(products);
-        when(productRepository.findAllById(anyCollection())).thenAnswer(invocation -> {
-            Collection<Long> ids = invocation.getArgument(0);
-            return catalog.stream().filter(product -> ids.contains(product.getId())).toList();
-        });
+        assertThatThrownBy(() -> checkoutService.checkout(SESSION, CHECKOUT_KEY, null)).isSameAs(failure);
+        verifyNoInteractions(paymentClient);
     }
 }

@@ -193,3 +193,21 @@ input[type='number'] {
 .confirmation .number {
   text-align: right;
 }
+
+.dev-scenario {
+  display: block;
+  font-size: 0.85rem;
+  margin-bottom: 0.5rem;
+}
+
+.status-success {
+  color: #1a7f37;
+}
+
+.status-failure {
+  color: #cf222e;
+}
+
+.status-pending {
+  color: var(--warning);
+}

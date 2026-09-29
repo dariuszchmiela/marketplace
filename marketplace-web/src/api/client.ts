@@ -81,5 +81,16 @@ export const api = {
 
   removeCartItem: (productId: number) => request<Cart>(`/api/cart/items/${productId}`, { method: 'DELETE' }),
 
-  checkout: () => request<Order>('/api/checkout', { method: 'POST' }),
+  // The same idempotency key must be sent again when retrying the same checkout attempt.
+  // paymentScenario is a dev-only failure simulation header (ignored unless the backend enables it).
+  checkout: (idempotencyKey: string, paymentScenario?: string) =>
+    request<Order>('/api/checkout', {
+      method: 'POST',
+      headers: {
+        'Idempotency-Key': idempotencyKey,
+        ...(paymentScenario ? { 'X-Payment-Scenario': paymentScenario } : {}),
+      },
+    }),
+
+  reconcilePayment: (orderId: number) => request<Order>(`/api/orders/${orderId}/reconcile-payment`, { method: 'POST' }),
 }

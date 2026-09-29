@@ -1,0 +1,14 @@
+spring:
+  application:
+    name: payment-service
+
+server:
+  port: ${PORT:8081}
+
+payment:
+  simulation:
+    # This service is a simulator by nature, so scenarios are on by default. The marketplace only
+    # forwards the X-Payment-Scenario header when it is explicitly configured to do so.
+    enabled: ${PAYMENT_SIMULATION_ENABLED:true}
+    # Must be longer than marketplace-service's payment.client.read-timeout (2s) to cause a timeout.
+    slow-delay: ${PAYMENT_SLOW_DELAY:5s}

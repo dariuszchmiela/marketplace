@@ -3,14 +3,19 @@ package pl.dch.marketplace;
 import java.math.BigDecimal;
 import java.util.UUID;
 
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
+import pl.dch.marketplace.payment.FakePaymentServer;
 import pl.dch.marketplace.product.Product;
 import pl.dch.marketplace.product.ProductRepository;
 
@@ -20,7 +25,8 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 
 /**
- * Full application against a real PostgreSQL (Testcontainers) with Flyway migrations applied.
+ * Full application against a real PostgreSQL (Testcontainers) with Flyway migrations applied, and a
+ * {@link FakePaymentServer} on a real local port in place of payment-service.
  * Tests isolate themselves by using a fresh session id and their own products,
  * so no database cleanup between tests is needed.
  */
@@ -30,6 +36,18 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 public abstract class IntegrationTestBase {
 
     protected static final String SESSION_HEADER = "X-Session-Id";
+    protected static final String IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
+
+    /** Shared by all integration tests (like the Spring context and the database container). */
+    protected static final FakePaymentServer PAYMENT_SERVICE = FakePaymentServer.start();
+
+    @DynamicPropertySource
+    static void paymentServiceProperties(DynamicPropertyRegistry registry) {
+        registry.add("payment.client.base-url", PAYMENT_SERVICE::baseUrl);
+        // Short values keep the timeout and retry tests fast.
+        registry.add("payment.client.read-timeout", () -> "500ms");
+        registry.add("payment.client.retry.initial-backoff", () -> "10ms");
+    }
 
     @Autowired
     protected MockMvc mockMvc;
@@ -40,7 +58,17 @@ public abstract class IntegrationTestBase {
     @Autowired
     protected JdbcTemplate jdbcTemplate;
 
+    @Autowired
+    protected CircuitBreaker paymentCircuitBreaker;
+
     protected final String session = UUID.randomUUID().toString();
+
+    @BeforeEach
+    void resetPaymentService() {
+        PAYMENT_SERVICE.reset();
+        // The circuit breaker is a singleton in the shared context; failures of one test must not leak.
+        paymentCircuitBreaker.reset();
+    }
 
     protected Product createProduct(String name, String price, int availableQuantity) {
         return productRepository.save(new Product(name, name + " description", new BigDecimal(price), availableQuantity));
@@ -64,6 +92,19 @@ public abstract class IntegrationTestBase {
 
     protected MockHttpServletRequestBuilder deleteWithSession(String url, Object... vars) {
         return delete(url, vars).header(SESSION_HEADER, session);
+    }
+
+    /** A new checkout attempt (fresh idempotency key). */
+    protected MockHttpServletRequestBuilder checkout() {
+        return checkout(UUID.randomUUID());
+    }
+
+    protected MockHttpServletRequestBuilder checkout(UUID idempotencyKey) {
+        return post("/api/checkout").header(SESSION_HEADER, session).header(IDEMPOTENCY_KEY_HEADER, idempotencyKey);
+    }
+
+    protected MockHttpServletRequestBuilder reconcilePayment(long orderId) {
+        return post("/api/orders/{id}/reconcile-payment", orderId).header(SESSION_HEADER, session);
     }
 
     protected static String addItemJson(long productId, int quantity) {

@@ -33,12 +33,26 @@ describe('api client', () => {
       ),
     )
 
-    const error = await api.checkout().catch((e: unknown) => e)
+    const error = await api.checkout(crypto.randomUUID()).catch((e: unknown) => e)
 
     expect(error).toBeInstanceOf(ApiError)
     expect((error as ApiError).status).toBe(409)
     expect((error as ApiError).code).toBe('INSUFFICIENT_STOCK')
     expect(errorMessage(error)).toBe('Only 1 item(s) available')
+  })
+
+  it('sends the checkout idempotency key and the optional payment scenario', async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => jsonResponse(201, { id: 1 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.checkout('key-1')
+    await api.checkout('key-1', 'DECLINED')
+
+    const [first, second] = fetchMock.mock.calls.map(([, init]) => new Headers((init as RequestInit).headers))
+    expect(first.get('Idempotency-Key')).toBe('key-1')
+    expect(first.get('X-Payment-Scenario')).toBeNull()
+    expect(second.get('Idempotency-Key')).toBe('key-1')
+    expect(second.get('X-Payment-Scenario')).toBe('DECLINED')
   })
 
   it('reports a network failure with a readable message', async () => {

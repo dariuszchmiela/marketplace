@@ -61,6 +61,18 @@ public class Cart {
     }
 
     /**
+     * Puts the items of an order whose payment failed back into the cart. The shopper may have
+     * added the same product in the meantime; the line is then capped at {@link CartItem#MAX_QUANTITY}
+     * instead of failing, because the order has to be closed either way.
+     */
+    public void restoreItem(Long productId, int quantity) {
+        int restorable = Math.min(quantity, CartItem.MAX_QUANTITY - quantityOf(productId));
+        if (restorable > 0) {
+            addItem(productId, restorable);
+        }
+    }
+
+    /**
      * The line quantity {@link #addItem} would produce, validated against the same limits,
      * without modifying the cart.
      */
