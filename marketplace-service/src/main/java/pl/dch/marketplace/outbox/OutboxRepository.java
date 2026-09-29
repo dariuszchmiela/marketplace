@@ -6,6 +6,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
+import org.jspecify.annotations.Nullable;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
@@ -35,12 +36,13 @@ public class OutboxRepository {
     }
 
     public void insert(UUID eventId, String aggregateType, String aggregateId, String eventType, int schemaVersion,
-                       int sequence, String payload, Instant occurredAt) {
+                       int sequence, String payload, Instant occurredAt, @Nullable String traceParent) {
         jdbcTemplate.update("""
                         insert into outbox_event (event_id, aggregate_type, aggregate_id, event_type, schema_version,
-                                                  sequence, payload, occurred_at)
-                        values (?, ?, ?, ?, ?, ?, ?::json, ?)""",
-                eventId, aggregateType, aggregateId, eventType, schemaVersion, sequence, payload, Timestamp.from(occurredAt));
+                                                  sequence, payload, occurred_at, trace_parent)
+                        values (?, ?, ?, ?, ?, ?, ?::json, ?, ?)""",
+                eventId, aggregateType, aggregateId, eventType, schemaVersion, sequence, payload, Timestamp.from(occurredAt),
+                traceParent);
     }
 
     /**
@@ -57,7 +59,7 @@ public class OutboxRepository {
     public List<OutboxRecord> claimBatch(int limit) {
         return jdbcTemplate.query("""
                         select o.id, o.event_id, o.aggregate_type, o.aggregate_id, o.event_type, o.schema_version,
-                               o.sequence, o.payload::text as payload, o.attempt_count
+                               o.sequence, o.payload::text as payload, o.attempt_count, o.trace_parent
                         from outbox_event o
                         where o.published_at is null
                           and (o.next_attempt_at is null or o.next_attempt_at <= clock_timestamp())
@@ -79,8 +81,39 @@ public class OutboxRepository {
                         rs.getInt("schema_version"),
                         rs.getInt("sequence"),
                         rs.getString("payload"),
-                        rs.getInt("attempt_count")),
+                        rs.getInt("attempt_count"),
+                        rs.getString("trace_parent")),
                 limit);
+    }
+
+    /**
+     * How far behind is publication? Read-only, for metrics and health — two plain SELECTs, no row locks (MVCC: they
+     * never wait for, or block, the publisher's {@code FOR UPDATE SKIP LOCKED} claim). Both use the partial index
+     * {@code idx_outbox_pending_by_id}; the count stops at {@code countLimit} so a huge backlog cannot turn a metrics
+     * scrape into a long scan (the gauge then reports the cap: "at least that many").
+     */
+    public Backlog backlog(int countLimit) {
+        Long pending = jdbcTemplate.queryForObject("""
+                select count(*) from (select 1 from outbox_event where published_at is null limit ?) pending""",
+                Long.class, countLimit);
+        Long retrying = jdbcTemplate.queryForObject("""
+                select count(*) from (select 1 from outbox_event where published_at is null and attempt_count > 0
+                                      limit ?) retrying""",
+                Long.class, countLimit);
+        Double oldestAgeSeconds = jdbcTemplate.query("""
+                        select extract(epoch from clock_timestamp() - occurred_at)
+                        from outbox_event where published_at is null order by id limit 1""",
+                rs -> rs.next() ? rs.getDouble(1) : 0.0);
+        return new Backlog(pending == null ? 0 : pending, retrying == null ? 0 : retrying,
+                oldestAgeSeconds == null ? 0.0 : oldestAgeSeconds);
+    }
+
+    /**
+     * @param pending          unpublished rows (capped)
+     * @param retrying         unpublished rows with at least one failed attempt (capped)
+     * @param oldestAgeSeconds age of the oldest unpublished row; 0 when nothing is pending
+     */
+    public record Backlog(long pending, long retrying, double oldestAgeSeconds) {
     }
 
     public void markPublished(long id) {

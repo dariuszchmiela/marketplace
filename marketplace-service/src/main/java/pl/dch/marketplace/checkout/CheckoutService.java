@@ -1,5 +1,6 @@
 package pl.dch.marketplace.checkout;
 
+import java.time.Duration;
 import java.util.UUID;
 
 import org.jspecify.annotations.Nullable;
@@ -35,13 +36,16 @@ public class CheckoutService {
     private final OrderPlacementService orderPlacement;
     private final PaymentClient paymentClient;
     private final OrderPaymentUpdater orderPaymentUpdater;
+    private final CheckoutMetrics metrics;
 
     public CheckoutService(OrderPlacementService orderPlacement,
                            PaymentClient paymentClient,
-                           OrderPaymentUpdater orderPaymentUpdater) {
+                           OrderPaymentUpdater orderPaymentUpdater,
+                           CheckoutMetrics metrics) {
         this.orderPlacement = orderPlacement;
         this.paymentClient = paymentClient;
         this.orderPaymentUpdater = orderPaymentUpdater;
+        this.metrics = metrics;
     }
 
     /**
@@ -51,9 +55,23 @@ public class CheckoutService {
      * @param paymentScenario dev/test failure scenario for payment-service, may be null
      */
     public CheckoutResult checkout(SessionId sessionId, UUID checkoutIdempotencyKey, @Nullable String paymentScenario) {
+        long start = System.nanoTime();
+        try {
+            CheckoutResult result = doCheckout(sessionId, checkoutIdempotencyKey, paymentScenario);
+            metrics.record(result.created() ? CheckoutMetrics.Result.of(result.order().status()) : CheckoutMetrics.Result.REPLAYED,
+                    Duration.ofNanos(System.nanoTime() - start));
+            return result;
+        } catch (RuntimeException ex) {
+            metrics.record(CheckoutMetrics.Result.of(ex), Duration.ofNanos(System.nanoTime() - start));
+            throw ex;
+        }
+    }
+
+    private CheckoutResult doCheckout(SessionId sessionId, UUID checkoutIdempotencyKey, @Nullable String paymentScenario) {
         OrderPlacementService.PlacedOrder placed;
         try {
-            placed = orderPlacement.placeOrder(sessionId, checkoutIdempotencyKey);
+            placed = metrics.step(CheckoutMetrics.Step.PLACE_ORDER,
+                    () -> orderPlacement.placeOrder(sessionId, checkoutIdempotencyKey));
         } catch (RuntimeException ex) {
             // Safety net for duplicates of the same attempt: if an order exists for this key, it is the
             // idempotent answer, whatever made our transaction fail. (Same-session checkouts are normally
@@ -76,11 +94,12 @@ public class CheckoutService {
                 order.id(), order.total(), checkoutIdempotencyKey, placed.paymentIdempotencyKey());
 
         // Transaction 1 is committed at this point.
-        PaymentOutcome outcome = paymentClient.pay(
+        PaymentOutcome outcome = metrics.step(CheckoutMetrics.Step.PAYMENT_CALL, () -> paymentClient.pay(
                 new RemotePayment.Request(order.id(), order.total(), Order.CURRENCY, placed.paymentIdempotencyKey()),
-                paymentScenario);
+                paymentScenario));
 
-        return CheckoutResult.created(orderPaymentUpdater.applyOutcome(order.id(), outcome));
+        return CheckoutResult.created(metrics.step(CheckoutMetrics.Step.APPLY_OUTCOME,
+                () -> orderPaymentUpdater.applyOutcome(order.id(), outcome)));
     }
 
     /**

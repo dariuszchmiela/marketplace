@@ -24,10 +24,12 @@ public class OutboxWriter {
 
     private final OutboxRepository repository;
     private final JsonMapper jsonMapper;
+    private final OutboxTracing tracing;
 
-    public OutboxWriter(OutboxRepository repository, JsonMapper jsonMapper) {
+    public OutboxWriter(OutboxRepository repository, JsonMapper jsonMapper, OutboxTracing tracing) {
         this.repository = repository;
         this.jsonMapper = jsonMapper;
+        this.tracing = tracing;
     }
 
     @Transactional(propagation = Propagation.MANDATORY)
@@ -38,7 +40,7 @@ public class OutboxWriter {
         EventEnvelope envelope = new EventEnvelope(eventId, eventType, schemaVersion, aggregateType, aggregateId,
                 sequence, occurredAt, payload);
         repository.insert(eventId, aggregateType, aggregateId, eventType, schemaVersion, sequence,
-                jsonMapper.writeValueAsString(envelope), occurredAt);
+                jsonMapper.writeValueAsString(envelope), occurredAt, tracing.currentTraceParent());
         log.info("outbox.created eventId={} eventType={} aggregateType={} aggregateId={} sequence={}",
                 eventId, eventType, aggregateType, aggregateId, sequence);
         return eventId;

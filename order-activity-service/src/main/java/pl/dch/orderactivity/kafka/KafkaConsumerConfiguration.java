@@ -19,6 +19,7 @@ import org.springframework.kafka.listener.DefaultErrorHandler;
 import org.springframework.kafka.support.ExponentialBackOffWithMaxRetries;
 import pl.dch.orderactivity.OrderActivityProperties;
 import pl.dch.orderactivity.event.PermanentEventException;
+import pl.dch.orderactivity.observability.OrderEventMetrics;
 
 /**
  * Retry and dead-letter policy of the consumer.
@@ -48,7 +49,8 @@ class KafkaConsumerConfiguration {
     }
 
     @Bean
-    DefaultErrorHandler orderEventErrorHandler(KafkaTemplate<String, String> kafkaTemplate, OrderActivityProperties properties) {
+    DefaultErrorHandler orderEventErrorHandler(KafkaTemplate<String, String> kafkaTemplate, OrderActivityProperties properties,
+                                               OrderEventMetrics metrics) {
         DeadLetterPublishingRecoverer deadLetter = new DeadLetterPublishingRecoverer(kafkaTemplate,
                 (record, failure) -> new TopicPartition(properties.topics().deadLetter(), record.partition()));
         deadLetter.excludeHeader(DeadLetterPublishingRecoverer.HeaderNames.HeadersToAdd.EX_STACKTRACE);
@@ -61,6 +63,7 @@ class KafkaConsumerConfiguration {
             log.warn("event.dead_lettered eventId={} eventType={} key={} topic={} partition={} offset={} error=\"{}\"",
                     header(record, "eventId"), header(record, "eventType"), record.key(), record.topic(),
                     record.partition(), record.offset(), rootMessage(failure));
+            metrics.deadLettered(header(record, "eventType"), isPermanent(failure));
             deadLetter.accept(record, failure);
         }, backOff);
         errorHandler.addNotRetryableExceptions(PermanentEventException.class);
@@ -69,6 +72,7 @@ class KafkaConsumerConfiguration {
                 log.warn("event.failed permanent=true eventId={} key={} partition={} offset={} error=\"{}\"",
                         header(record, "eventId"), record.key(), record.partition(), record.offset(), rootMessage(failure));
             } else {
+                metrics.retry(header(record, "eventType"));
                 log.warn("event.retry eventId={} key={} partition={} offset={} failedAttempt={} maxRetries={} error=\"{}\"",
                         header(record, "eventId"), record.key(), record.partition(), record.offset(), deliveryAttempt,
                         properties.retry().maxRetries(), rootMessage(failure));

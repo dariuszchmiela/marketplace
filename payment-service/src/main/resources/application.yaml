@@ -16,3 +16,64 @@ payment:
     # Shared secret the marketplace sends as "Authorization: Bearer ...". The default is for LOCAL DEVELOPMENT ONLY
     # (a warning is logged when it is used); any shared/deployed environment sets PAYMENT_SERVICE_TOKEN.
     service-token: ${PAYMENT_SERVICE_TOKEN:dev-only-payment-service-token}
+  management:
+    # Bearer token for /actuator/** except the public health probes (Prometheus sends it). Separate from the service
+    # token. LOCAL DEVELOPMENT default only (a warning is logged); set MANAGEMENT_TOKEN anywhere else.
+    token: ${MANAGEMENT_TOKEN:dev-only-management-token}
+
+logging:
+  pattern:
+    # traceId/spanId from the MDC on every log line (empty outside a traced request), key=value like the messages.
+    correlation: "[traceId=%X{traceId:-} spanId=%X{spanId:-}] "
+
+# --- Phase 6: management endpoints, metrics, tracing ------------------------------------------------------------
+management:
+  endpoints:
+    web:
+      exposure:
+        # Explicit allow-list; env, configprops, heapdump, threaddump, ... are never exposed over HTTP.
+        include: health, info, metrics, prometheus
+  endpoint:
+    health:
+      show-details: never
+      show-components: never
+      probes:
+        enabled: true
+      group:
+        liveness:
+          include: livenessState
+        readiness:
+          # In-memory service: no external dependency decides whether it can serve traffic.
+          include: readinessState
+        dependencies:
+          # Token-protected operator view with details (here only local checks: disk space, ping).
+          include: diskSpace, ping
+          show-details: always
+          show-components: always
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      # Histogram buckets for p50/p95/p99 via Prometheus histogram_quantile(); only for request latency.
+      percentiles-histogram:
+        http.server.requests: true
+      minimum-expected-value:
+        http.server.requests: 1ms
+      maximum-expected-value:
+        http.server.requests: 30s
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
+    propagation:
+      # Accepts the marketplace's W3C traceparent header: payment spans join the checkout's trace.
+      type: w3c
+    export:
+      otlp:
+        # Spans are created and propagated always; exported to the OTLP endpoint only with TRACING_EXPORT_ENABLED=true.
+        # (Not management.tracing.export.enabled: in Boot 4 that switch also turns off propagation.)
+        enabled: ${TRACING_EXPORT_ENABLED:false}
+  opentelemetry:
+    tracing:
+      export:
+        otlp:
+          endpoint: ${OTLP_TRACING_ENDPOINT:http://localhost:4318/v1/traces}

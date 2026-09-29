@@ -19,6 +19,9 @@
         <java.version>25</java.version>
         <springdoc.version>3.1.1</springdoc.version>
         <resilience4j.version>2.4.0</resilience4j.version>
+        <!-- Normal builds: everything except the tagged production/JVM lab (profile production-lab flips this). -->
+        <lab.groups></lab.groups>
+        <lab.excludedGroups>production-lab</lab.excludedGroups>
     </properties>
 
     <dependencies>
@@ -50,6 +53,26 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-session-jdbc</artifactId>
         </dependency>
+        <!-- Phase 6: management endpoints + Micrometer metrics (Prometheus format) + tracing (Micrometer Tracing,
+             OpenTelemetry bridge, W3C trace context, OTLP span export). Metrics are scraped, not pushed over OTLP. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-opentelemetry</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>io.micrometer</groupId>
+                    <artifactId>micrometer-registry-otlp</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
         <dependency>
             <groupId>org.flywaydb</groupId>
             <artifactId>flyway-database-postgresql</artifactId>
@@ -75,6 +98,12 @@
             <artifactId>resilience4j-retry</artifactId>
             <version>${resilience4j.version}</version>
         </dependency>
+        <!-- Circuit breaker / retry state as Micrometer meters. -->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-micrometer</artifactId>
+            <version>${resilience4j.version}</version>
+        </dependency>
 
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -84,6 +113,11 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webmvc-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-opentelemetry-test</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>
@@ -137,8 +171,22 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <configuration>
                     <argLine>-javaagent:${org.mockito:mockito-core:jar}</argLine>
+                    <!-- Slow production/JVM experiments run only with -Pproduction-lab (see productionlab/package-info). -->
+                    <groups>${lab.groups}</groups>
+                    <excludedGroups>${lab.excludedGroups}</excludedGroups>
                 </configuration>
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!-- mvn test -Pproduction-lab [-Dtest=HikariPoolExhaustionLabTest] [-Dlab.hold=60s] -->
+        <profile>
+            <id>production-lab</id>
+            <properties>
+                <lab.groups>production-lab</lab.groups>
+                <lab.excludedGroups>none</lab.excludedGroups>
+            </properties>
+        </profile>
+    </profiles>
 </project>

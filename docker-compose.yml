@@ -46,5 +46,53 @@ services:
       timeout: 10s
       retries: 20
 
+  # --- Optional observability stack (Phase 6): docker compose --profile observability up -d ---------------------------
+  # Local training setup only: no persistence, fixed dev credentials, anonymous Grafana viewer.
+
+  # Scrapes /actuator/prometheus of the three services running on the host (mvn spring-boot:run / java -jar).
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: marketplace-prometheus
+    profiles: ["observability"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2d
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    extra_hosts:
+      # Docker Desktop provides host.docker.internal; on Linux this maps it to the host.
+      - "host.docker.internal:host-gateway"
+
+  # Dashboards (provisioned from the repository) over Prometheus, with Jaeger as trace datasource.
+  grafana:
+    image: grafana/grafana:12.1.1
+    container_name: marketplace-grafana
+    profiles: ["observability"]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_DEFAULT_THEME: light
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+  # Tracing backend: receives OTLP from the services (TRACING_EXPORT_ENABLED=true), UI on http://localhost:16686.
+  # Jaeger v2 all-in-one keeps traces in memory: lightweight, gone on restart.
+  jaeger:
+    image: jaegertracing/jaeger:2.9.0
+    container_name: marketplace-jaeger
+    profiles: ["observability"]
+    ports:
+      - "16686:16686"   # UI
+      - "4318:4318"     # OTLP over HTTP (the services export here)
+
 volumes:
   marketplace-postgres-data:

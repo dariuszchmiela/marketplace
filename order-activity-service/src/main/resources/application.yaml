@@ -32,6 +32,12 @@ spring:
       ack-mode: record
       # One consumer thread per partition of the order-events topic.
       concurrency: 3
+      # Consumer spans that continue the producer's W3C trace (traceparent header), MDC trace ids in the listener's
+      # log lines, and a spring.kafka.listener timer.
+      observation-enabled: true
+    template:
+      # The DLT producer: dead-lettered records carry the trace of the failed processing.
+      observation-enabled: true
 
 server:
   port: ${PORT:8082}
@@ -53,7 +59,69 @@ order-activity:
     # Every /api/ call (projection read, simulation) needs "Authorization: Bearer <token>". Separate secret from the
     # payment token. The default is for LOCAL DEVELOPMENT ONLY (a warning is logged); set ORDER_ACTIVITY_API_TOKEN elsewhere.
     api-token: ${ORDER_ACTIVITY_API_TOKEN:dev-only-order-activity-token}
+  management:
+    # Bearer token for /actuator/** except the public health probes (Prometheus sends it). Separate from the API token.
+    # LOCAL DEVELOPMENT default only (a warning is logged); set MANAGEMENT_TOKEN anywhere else.
+    token: ${MANAGEMENT_TOKEN:dev-only-management-token}
 
 logging:
   level:
     org.apache.kafka: WARN
+  pattern:
+    # traceId/spanId from the MDC on every log line; the listener's lines carry the marketplace checkout's trace id.
+    correlation: "[traceId=%X{traceId:-} spanId=%X{spanId:-}] "
+
+# --- Phase 6: management endpoints, metrics, tracing ------------------------------------------------------------
+management:
+  endpoints:
+    web:
+      exposure:
+        # Explicit allow-list; env, configprops, heapdump, threaddump, ... are never exposed over HTTP.
+        include: health, info, metrics, prometheus
+  endpoint:
+    health:
+      show-details: never
+      show-components: never
+      status:
+        # DEGRADED (consumer stopped) ranks below UP for the public status: the API still serves projections.
+        order: down, out-of-service, up, degraded, unknown
+      probes:
+        enabled: true
+      group:
+        liveness:
+          include: livenessState
+        readiness:
+          # Projection reads need the database; the Kafka consumer is NOT a readiness condition.
+          include: readinessState, db
+        dependencies:
+          # Token-protected operator view with details. Passive checks only.
+          include: db, kafkaConsumer
+          show-details: always
+          show-components: always
+          status:
+            order: down, out-of-service, degraded, unknown, up
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      minimum-expected-value:
+        http.server.requests: 1ms
+      maximum-expected-value:
+        http.server.requests: 30s
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
+    propagation:
+      type: w3c
+    export:
+      otlp:
+        # Spans are created and propagated always; exported to the OTLP endpoint only with TRACING_EXPORT_ENABLED=true.
+        # (Not management.tracing.export.enabled: in Boot 4 that switch also turns off propagation.)
+        enabled: ${TRACING_EXPORT_ENABLED:false}
+  opentelemetry:
+    tracing:
+      export:
+        otlp:
+          endpoint: ${OTLP_TRACING_ENDPOINT:http://localhost:4318/v1/traces}

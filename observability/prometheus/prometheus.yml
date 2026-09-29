@@ -1,0 +1,34 @@
+# Prometheus configuration for the local observability profile (docker compose --profile observability up -d).
+# The services run on the host; Prometheus runs in Docker and reaches them via host.docker.internal.
+global:
+  # Lab setting: fast feedback while running experiments. Production commonly scrapes every 15-60 s.
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # /actuator/prometheus requires the management token (Authorization: Bearer ...). The value below is the LOCAL
+  # DEVELOPMENT default (MANAGEMENT_TOKEN unset). With a real token use `credentials_file` pointing to a mounted secret
+  # instead of a literal in this file.
+  - job_name: marketplace-service
+    metrics_path: /actuator/prometheus
+    authorization:
+      type: Bearer
+      credentials: dev-only-management-token
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+
+  - job_name: payment-service
+    metrics_path: /actuator/prometheus
+    authorization:
+      type: Bearer
+      credentials: dev-only-management-token
+    static_configs:
+      - targets: ["host.docker.internal:8081"]
+
+  - job_name: order-activity-service
+    metrics_path: /actuator/prometheus
+    authorization:
+      type: Bearer
+      credentials: dev-only-management-token
+    static_configs:
+      - targets: ["host.docker.internal:8082"]

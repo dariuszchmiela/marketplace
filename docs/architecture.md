@@ -1,4 +1,4 @@
-# Architecture (Phase 5)
+# Architecture (Phase 6)
 
 ## Overview
 
@@ -21,7 +21,9 @@ Vite proxy ──► marketplace-service (Java, Spring Boot, :8080) ──HTTP +
 ```
 
 Three backend services and one frontend. The frontend uses only the synchronous marketplace API; the event path is
-downstream of it and never on a user request path. Users authenticate with a server-side session (Phase 5).
+downstream of it and never on a user request path. Users authenticate with a server-side session (Phase 5). All three
+services expose Prometheus metrics and W3C-propagated traces (Phase 6); an optional Compose profile runs Prometheus,
+Grafana and Jaeger next to them.
 
 ## Backend: `marketplace-service`
 
@@ -687,6 +689,58 @@ identity, and ACLs such as: marketplace-service may *produce* to `marketplace.or
 `spring.kafka.security.*` / `spring.kafka.properties.sasl.*` properties could be supplied via environment, but nothing
 of that is configured or tested here.
 
+## Observability and production diagnostics (Phase 6)
+
+Details, runbook, playbooks and measured results: [`production-diagnostics.md`](production-diagnostics.md). In short:
+
+```text
+                         ┌──────────── scrape /actuator/prometheus (Bearer MANAGEMENT_TOKEN) ────────────┐
+Prometheus :9090 ◄───────┤  marketplace-service :8080   payment-service :8081   order-activity :8082     │
+Grafana :3000 (dashboard as code)                                                                         │
+Jaeger :16686 ◄── OTLP spans (TRACING_EXPORT_ENABLED=true) ── all three services ─────────────────────────┘
+```
+
+- **Management endpoints.** Exposed: `health`, `info`, `metrics`, `prometheus` (nothing else). Health probes are public
+  and status-only. Everything else needs the management bearer token. In marketplace-service a separate, stateless
+  Spring Security chain handles `/actuator/**` (`observability/ManagementSecurityConfiguration`, `@Order(1)`), so the
+  shopper's session cookie is not accepted and no CSRF applies. The other two services use a servlet filter. The
+  alternative (a management port on an internal network) was not chosen: here everything runs on one host, and the
+  token makes the boundary testable.
+- **Metrics.** Framework metrics (HTTP server/client histograms, JVM, process, HikariCP, Tomcat threads, Kafka client
+  incl. consumer lag, Spring Kafka observations, Resilience4j) plus deliberate business metrics:
+  - checkout outcome and duration, and per-step duration;
+  - payment client result and duration per logical call;
+  - outbox backlog, lag, success/failure, batch lock time;
+  - consumer processed/duplicate/stale/retry/DLT;
+  - security counters.
+
+  Tags are bounded (enums, URI templates). Identifiers never become labels, and a test scrapes Prometheus to prove it.
+  Counters are pre-registered so `rate()`/`increase()` see their first increment.
+- **Percentiles.** Histogram buckets only on the latency timers that matter (`http.server.requests`,
+  `http.client.requests`, `marketplace.checkout.duration`, `payment.client.duration`). Prometheus computes
+  p50/p95/p99, aggregatable across instances.
+- **Health.**
+  - liveness: no dependencies;
+  - readiness: database only;
+  - `dependencies` group (token): db, outbox, payment-service in the marketplace; db and Kafka consumer in
+    order-activity.
+
+  All checks are passive (circuit breaker state, cached outbox backlog, listener container state), never probes. An
+  impaired dependency reports `DEGRADED`, which ranks below UP for the public status.
+- **Tracing.** Micrometer Tracing + OpenTelemetry bridge, W3C `traceparent`, 100% sampling in the lab.
+  - The payment `RestClient` gets the `ObservationRegistry`, so client spans and the header are propagated.
+  - The outbox stores the creating transaction's traceparent (`outbox_event.trace_parent`, V7). The publisher
+    restores it as the parent of an `outbox publish` span (a `ReceiverContext` with the row as carrier), under which
+    Spring Kafka's producer observation writes the Kafka header. The consumer observation continues it.
+  - One checkout is one trace across three services, and the outbox delay is visible as the gap before the publish
+    span.
+- **Logs.** `logging.pattern.correlation` adds `[traceId=… spanId=…]` from the MDC to every line in all three services.
+- **The transaction boundaries did not change.** Instrumentation wraps the orchestration from outside (timers around
+  the existing steps), and `PaymentClient.requireNoTransaction()` still guards the "no remote call inside a DB
+  transaction" invariant (tested).
+- **Lab.** `marketplace-service/src/test/.../productionlab` (tag `production-lab`, `mvn test -Pproduction-lab`) and
+  `tools/production-lab` (load generator, GC/OOM demo). There is no intentional bug in any production code path.
+
 ## Frontend: `marketplace-web`
 
 React 19 + TypeScript + Vite, plain CSS, no UI framework, no router, no global state library.
@@ -731,6 +785,15 @@ logout, fixation, planted id, CSRF reset, expiry), `CsrfIntegrationTest`, `Autho
 401s, `X-Session-Id` ignored, cart/order isolation, same idempotency key for two users, no owner key in responses),
 `CorsAndHeadersIntegrationTest`. All older integration tests now sign up a real user per test.
 
+Phase 6 observability tests: `observability/ManagementEndpointsIntegrationTest` (public status-only probes, token for
+metrics/dependencies, shopper session rejected, dangerous endpoints 404, DEGRADED payment dependency keeps readiness UP),
+`BusinessMetricsIntegrationTest` (checkout outcomes/timers, security counters, no identifier or secret in any Prometheus
+label), `outbox/OutboxMetricsIntegrationTest` (backlog grows during a simulated Kafka outage and drains, no blocking behind
+the publisher's claim), `outbox/TracePropagationIntegrationTest` (client traceparent → payment header → outbox rows → Kafka
+headers), metric assertions in `PaymentClientTest` and `CheckoutServiceTest`. The integration tests run with
+`@AutoConfigureMetrics`/`@AutoConfigureTracing` (Prometheus registry and real tracing). The production/JVM lab
+(`productionlab/`, 15 experiments) is excluded from `mvn test` and runs with `-Pproduction-lab`.
+
 order-activity-service (`mvn test`): `OrderEventParserTest` (contract, tolerant reader, malformed/unsupported),
 `OrderActivityConsumerIntegrationTest` (real Kafka + PostgreSQL: eventual projection, ordering, duplicate delivery,
 transient retry with rollback, exhausted retries → DLT and continue, malformed/unsupported/impossible transition → DLT,
@@ -739,7 +802,9 @@ stale replay ignored).
 payment-service (`mvn test`): `PaymentServiceTest` (idempotency incl. 32 concurrent threads), `ScenarioSimulatorTest`,
 `PaymentApiIntegrationTest` (real HTTP on a random port: every scenario, 16 concurrent HTTP requests with one key),
 `ServiceTokenIntegrationTest` (missing/wrong/right token, lookups protected, token not logged). order-activity-service also has
-`InternalApiSecurityIntegrationTest`.
+`InternalApiSecurityIntegrationTest`. Phase 6: `ConsumerObservabilityIntegrationTest` (processed/duplicate/stale/retry/DLT
+counters, unknown event types not used as labels, trace continued from the producer, management token, consumer lag metric)
+and payment-service `ObservabilityIntegrationTest` (management boundary, counters, traceparent continued into the logs).
 
 Frontend (`npm test`, Vitest + Testing Library): idempotency key reuse per attempt, one request per double click,
 rendering of paid/declined/technical failure/unknown, reconciliation button, reload + new attempt after
@@ -763,5 +828,7 @@ session restore via `/me`, logout, 401 → logged-out view.
   when enough units were left (false conflict on a hot product). See Concurrency for the alternatives.
 - **Security extras:** no login rate limiting / account lockout, no password reset or email verification, no MFA, no
   OAuth/external IdP, no roles beyond "user", no Kafka authentication/ACLs, no mTLS between services (see Security).
-- **Operations:** no metrics, tracing, Actuator/health checks, containerized services or deployment.
+- **Operations beyond Phase 6:** no alerting rules / Alertmanager, no log aggregation (Loki/ELK), no SLOs, no
+  continuous profiling; the observability stack is local-only (no persistence, dev credentials); services are not
+  containerized and there is no deployment. Management endpoints use a shared static token (no mTLS / workload identity).
 - Catalog management, pagination, stock reservation with expiry, multiple currencies, taxes, shipping.

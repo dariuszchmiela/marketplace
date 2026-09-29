@@ -6,8 +6,11 @@ import java.net.ServerSocket;
 import java.net.URI;
 import java.time.Duration;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.micrometer.observation.ObservationRegistry;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -37,6 +40,7 @@ class PaymentClientTest {
             new RemotePayment.Request(42L, new BigDecimal("129.50"), "PLN", UUID.randomUUID());
 
     private CircuitBreaker circuitBreaker;
+    private SimpleMeterRegistry meterRegistry;
     private PaymentClient client;
 
     @BeforeAll
@@ -271,6 +275,54 @@ class PaymentClientTest {
     }
 
     @Test
+    void everyLogicalCallIsMeasuredWithABoundedResultTag() {
+        Duration openDuration = Duration.ofSeconds(10);
+        PaymentClient guarded = client(server.baseUrl(), new PaymentClientProperties.CircuitBreaker(50, 5, 5, openDuration, 1), false);
+
+        server.respondWith(succeed());
+        guarded.pay(newRequest(), null);
+        server.respondWith(decline());
+        guarded.pay(newRequest(), null);
+        server.respondWith(fail(503), fail(503), fail(503));   // one logical call, three attempts
+        guarded.pay(newRequest(), null);
+        guarded.pay(newRequest(), null);                           // 3 of 5 recorded calls failed: circuit open, fails fast
+        assertThatThrownBy(() -> guarded.findByIdempotencyKey(UUID.randomUUID()))   // lookup fails fast too
+                .isInstanceOf(MarketplaceException.class);
+
+        assertThat(callCount("pay", "success")).isEqualTo(1);
+        assertThat(callCount("pay", "declined")).isEqualTo(1);
+        assertThat(callCount("pay", "server_error")).isEqualTo(1);
+        assertThat(callCount("pay", "circuit_open")).isEqualTo(1);
+        assertThat(callCount("lookup", "circuit_open")).isEqualTo(1);
+        assertThat(meterRegistry.get(PaymentClientMetrics.DURATION).tags("operation", "pay", "result", "server_error")
+                .timer().count()).isEqualTo(1);
+        // Only bounded tags: operation and result. Never an order id, payment id or idempotency key.
+        assertThat(meterRegistry.getMeters()).allSatisfy(meter ->
+                assertThat(meter.getId().getTags()).extracting(tag -> tag.getKey())
+                        .containsOnly("operation", "result"));
+    }
+
+    @Test
+    void responseTimeoutIsMeasuredAsTimeout() {
+        server.respondWith(succeedButRespondAfter(READ_TIMEOUT.multipliedBy(4)));
+
+        client.pay(request, null);
+
+        assertThat(callCount("pay", "timeout")).isEqualTo(1);
+        assertThat(meterRegistry.get(PaymentClientMetrics.DURATION).tags("result", "timeout").timer()
+                .totalTime(TimeUnit.MILLISECONDS)).isGreaterThanOrEqualTo(READ_TIMEOUT.toMillis());
+    }
+
+    private static RemotePayment.Request newRequest() {
+        return new RemotePayment.Request(42L, new BigDecimal("129.50"), "PLN", UUID.randomUUID());
+    }
+
+    private double callCount(String operation, String result) {
+        var counter = meterRegistry.find(PaymentClientMetrics.CALLS).tags("operation", operation, "result", result).counter();
+        return counter == null ? 0 : counter.count();
+    }
+
+    @Test
     void refusesToCallPaymentServiceInsideADatabaseTransaction() {
         TransactionSynchronizationManager.setActualTransactionActive(true);
         try {
@@ -299,8 +351,10 @@ class PaymentClientTest {
                 circuitBreakerProperties,
                 serviceToken);
         circuitBreaker = PaymentClientConfiguration.circuitBreaker(properties.circuitBreaker());
-        return new PaymentClient(PaymentClientConfiguration.restClient(properties), circuitBreaker,
-                PaymentClientConfiguration.retry(properties.retry()), properties.forwardScenarioHeader());
+        meterRegistry = new SimpleMeterRegistry();
+        return new PaymentClient(PaymentClientConfiguration.restClient(properties, ObservationRegistry.NOOP), circuitBreaker,
+                PaymentClientConfiguration.retry(properties.retry()), properties.forwardScenarioHeader(),
+                new PaymentClientMetrics(meterRegistry));
     }
 
     private static int freePort() throws IOException {

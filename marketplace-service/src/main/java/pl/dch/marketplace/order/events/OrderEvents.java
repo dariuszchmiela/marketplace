@@ -7,6 +7,7 @@ import java.util.UUID;
 
 import org.springframework.stereotype.Component;
 import pl.dch.marketplace.order.Order;
+import pl.dch.marketplace.outbox.OutboxMetrics;
 import pl.dch.marketplace.outbox.OutboxWriter;
 
 /**
@@ -49,8 +50,9 @@ public class OrderEvents {
 
     private final OutboxWriter outbox;
 
-    public OrderEvents(OutboxWriter outbox) {
+    public OrderEvents(OutboxWriter outbox, OutboxMetrics outboxMetrics) {
         this.outbox = outbox;
+        outboxMetrics.registerEventTypes(ORDER_CREATED, ORDER_PAID, ORDER_PAYMENT_FAILED, ORDER_PAYMENT_UNKNOWN);
     }
 
     public UUID orderCreated(Order order) {

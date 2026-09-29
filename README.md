@@ -4,10 +4,27 @@ A small, working marketplace used as a training ground for a Senior Fullstack (J
 technical interview. It is **not** a portfolio clone of a real marketplace: every piece exists to give
 concrete, runnable examples for interview topics (Stream API, money, transactions, JPA, REST, React state,
 HTTP resilience, idempotency, distributed failures, concurrency, thread pools, virtual threads, Kafka,
-transactional outbox, eventual consistency, authentication, sessions, CSRF, CORS, …).
+transactional outbox, eventual consistency, authentication, sessions, CSRF, CORS, metrics, tracing, JVM diagnostics, …).
 
-Current state: **Phase 5, security** (on top of Phase 4 Kafka + outbox, Phase 3 concurrency lab and Phase 2 payment
-integration):
+Current state: **Phase 6, observability + JVM / production diagnostics** (on top of Phase 5 security, Phase 4 Kafka +
+outbox, Phase 3 concurrency lab and Phase 2 payment integration):
+
+- **Metrics:** Actuator + Micrometer in all three services, Prometheus format: HTTP latency histograms (p50/p95/p99),
+  JVM heap/GC/threads/CPU, HikariCP, Tomcat threads, Kafka client metrics (consumer lag), Resilience4j, plus deliberate
+  business metrics (checkout outcomes and duration, payment client results, outbox backlog/lag, consumer
+  processed/duplicate/retry/DLT, login/CSRF/token rejections). Bounded tags only: no ids, emails or tokens as labels.
+- **Management security:** `/actuator/health` (+ liveness/readiness) public and status-only; metrics, Prometheus and the
+  detailed `dependencies` health group need a management bearer token; env/heapdump/threaddump are not exposed.
+- **Tracing:** Micrometer Tracing + OpenTelemetry, W3C `traceparent`: one trace from the HTTP request through
+  payment-service, across the outbox gap (context stored in the outbox row) and Kafka into order-activity-service;
+  trace/span ids in every log line.
+- **Local stack** (`docker compose --profile observability up -d`): Prometheus, Grafana with a provisioned diagnostics
+  dashboard, Jaeger.
+- **Production/JVM lab** (training only, never in the application): pool exhaustion, slow downstream, executor
+  saturation, lock contention and thread dumps, virtual threads, CPU-bound work, heap retention, GC and JFR, a load
+  generator. See [`docs/production-diagnostics.md`](docs/production-diagnostics.md) (runbook, playbooks, measured results).
+
+Phase 5 (still in place), security:
 
 - **Users and login:** register/login/logout with email + password (BCrypt), Spring Security with a **server-side
   session** stored in PostgreSQL (Spring Session JDBC) and identified by the HttpOnly `MARKETPLACE_SESSION` cookie.
@@ -90,6 +107,10 @@ docker compose ps          # wait until both are "healthy"
 | `SESSION_COOKIE_SECURE` | marketplace-service | `true` | `Secure` flag of the session cookie; set `false` for plain-HTTP local development |
 | `SESSION_TIMEOUT` | marketplace-service | `30m` | idle timeout of the server-side session |
 | `APP_CORS_ALLOWED_ORIGINS` | marketplace-service | `http://localhost:5173` | exact origins allowed to call the API with cookies (comma-separated, never `*`) |
+| `MANAGEMENT_TOKEN` | all three services | `dev-only-management-token` | bearer token for `/actuator/**` except the public health probes (Prometheus sends it) |
+| `TRACING_EXPORT_ENABLED` | all three services | `false` | export spans over OTLP (to Jaeger from the observability profile); spans and propagation work without it |
+| `OTLP_TRACING_ENDPOINT` | all three services | `http://localhost:4318/v1/traces` | OTLP/HTTP span endpoint |
+| `TRACING_SAMPLING_PROBABILITY` | all three services | `1.0` | share of traces sampled (lab: all) |
 
 The `dev-only-…` defaults exist only so that the lab starts without setup; the services log a warning when they are
 used. Any shared or deployed environment must set real secrets. Production traffic is expected behind HTTPS (TLS
@@ -152,6 +173,25 @@ the session and CSRF cookies just work). The catalog is visible without login; r
 A page reload keeps you logged in (the app asks `/api/auth/me`). In dev mode the cart shows a "Payment scenario (dev)"
 select; it only has an effect when marketplace-service forwards the scenario header.
 
+### 6. Optional: observability stack (Prometheus, Grafana, Jaeger)
+
+```bash
+docker compose --profile observability up -d   # Prometheus :9090, Grafana :3000, Jaeger :16686 (OTLP :4318)
+# start the three services with TRACING_EXPORT_ENABLED=true to send spans to Jaeger
+java tools/production-lab/LoadGenerator.java --scenario browse --concurrency 20 --requests 5000
+```
+
+- Grafana http://localhost:3000 (anonymous viewer, admin/admin): dashboard *Marketplace - production diagnostics*,
+  provisioned from `observability/grafana/`.
+- Prometheus http://localhost:9090/targets scrapes the three services on the host (`observability/prometheus/prometheus.yml`,
+  with the local management token).
+- Jaeger http://localhost:16686: one checkout = one trace across marketplace-service, payment-service and
+  order-activity-service.
+- Metrics by hand: `curl -H "Authorization: Bearer dev-only-management-token" localhost:8080/actuator/prometheus`.
+
+The runbook (jcmd, JFR, thread/heap dumps, GC logs), troubleshooting playbooks and the measured experiments are in
+[`docs/production-diagnostics.md`](docs/production-diagnostics.md).
+
 ## Running tests
 
 ```bash
@@ -166,6 +206,10 @@ mvn test -Dtest='pl.dch.marketplace.lab.*Test'
 
 # only the Phase 4 outbox / Kafka tests (real Kafka via Testcontainers)
 mvn test -Dtest='pl.dch.marketplace.outbox.*Test'
+
+# Phase 6 production/JVM lab: tagged production-lab, NOT part of `mvn test`; [PROD-LAB] lines show observations
+mvn test -Pproduction-lab
+mvn test -Pproduction-lab -Dtest=LockContentionLabTest -Dlab.hold=60s   # keeps the state for jcmd (PID printed)
 
 # payment-service: unit tests + HTTP tests on a random port (no Docker needed)
 cd payment-service
@@ -265,10 +309,13 @@ On Windows Git Bash, prefix `docker exec … /opt/kafka/…` commands with `MSYS
 ```text
 .
 ├── README.md
-├── docker-compose.yml          PostgreSQL + Kafka (KRaft) for local development
+├── docker-compose.yml          PostgreSQL + Kafka (KRaft); profile "observability": Prometheus, Grafana, Jaeger
 ├── docs/
 │   ├── architecture.md         current architecture, decisions, what is not implemented
+│   ├── production-diagnostics.md  metrics, tracing, health, jcmd/JFR runbook, playbooks, lab results
 │   └── interview-map.md        interview topic → code location
+├── observability/              Prometheus scrape config, Grafana datasources + dashboard (as code)
+├── tools/production-lab/       LoadGenerator.java (HTTP load, p50/p95/p99), MemoryDemo.java (GC log, OOM, jcmd target)
 ├── marketplace-service/        Spring Boot 4 / Java 25 backend
 │   └── src/main/java/pl/dch/marketplace/
 │       ├── product/            catalog (entity, read API)
@@ -279,11 +326,13 @@ On Windows Git Bash, prefix `docker exec … /opt/kafka/…` commands with `MSYS
 │       ├── payment/            payment-service HTTP client: timeouts, retry, circuit breaker
 │       ├── cart/               cart of the logged-in user (aggregate + API)
 │       ├── session/            SessionId (owner key) resolved from the authenticated principal
+│       ├── observability/      management endpoint security (token), security metrics
 │       └── common/             error codes and the global API error format
 ├── payment-service/            Spring Boot 4 / Kotlin simulated payment provider
 │   └── src/main/kotlin/pl/dch/payment/
 │       ├── payments/           Payment, idempotent PaymentService, in-memory repository
 │       ├── simulation/         X-Payment-Scenario failure scenarios
+│       ├── observability/      business/security metrics, management token filter
 │       └── api/                REST controller, DTOs, error handler
 ├── order-activity-service/     Spring Boot 4 / Java 25 Kafka consumer (idempotent projection, retry, DLT)
 │   └── src/main/java/pl/dch/orderactivity/
@@ -291,6 +340,7 @@ On Windows Git Bash, prefix `docker exec … /opt/kafka/…` commands with `MSYS
 │       ├── activity/           projector (one local transaction), processed_event + order_activity repositories
 │       ├── kafka/              listener, retry / dead-letter configuration
 │       ├── simulation/         deterministic failure injection (dev/test only)
+│       ├── observability/      consumer metrics, passive consumer health, management token filter
 │       └── api/                read-only projection API
 └── marketplace-web/            React 19 + TypeScript + Vite frontend
     └── src/

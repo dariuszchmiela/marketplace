@@ -20,6 +20,7 @@ import org.springframework.web.bind.annotation.RequestBody
 import org.springframework.web.bind.annotation.RequestHeader
 import org.springframework.web.bind.annotation.RequestMapping
 import org.springframework.web.bind.annotation.RestController
+import pl.dch.payment.observability.PaymentMetrics
 import pl.dch.payment.payments.CreatePaymentCommand
 import pl.dch.payment.payments.Payment
 import pl.dch.payment.payments.PaymentService
@@ -70,6 +71,7 @@ data class PaymentResponse(
 class PaymentController(
     private val paymentService: PaymentService,
     private val simulator: ScenarioSimulator,
+    private val metrics: PaymentMetrics,
 ) {
 
     /**
@@ -83,6 +85,7 @@ class PaymentController(
     ): ResponseEntity<PaymentResponse> {
         val command = request.toCommand()
         val scenario = simulator.resolve(scenarioHeader)
+        metrics.scenario(scenario)
 
         simulator.beforeProcessing(scenario, command.idempotencyKey)
         val result = paymentService.createPayment(command, simulator.authorizationDecision(scenario))

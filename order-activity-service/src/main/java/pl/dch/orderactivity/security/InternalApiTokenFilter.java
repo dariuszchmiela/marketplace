@@ -17,6 +17,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.web.filter.OncePerRequestFilter;
+import pl.dch.orderactivity.observability.OrderEventMetrics;
 import tools.jackson.databind.json.JsonMapper;
 
 /**
@@ -30,13 +31,15 @@ public class InternalApiTokenFilter extends OncePerRequestFilter {
 
     private final byte[] expected;
     private final JsonMapper jsonMapper;
+    private final OrderEventMetrics metrics;
 
-    public InternalApiTokenFilter(String token, JsonMapper jsonMapper) {
+    public InternalApiTokenFilter(String token, JsonMapper jsonMapper, OrderEventMetrics metrics) {
         if (token == null || token.isBlank()) {
             throw new IllegalArgumentException("order-activity.security.api-token must be set");
         }
         this.expected = ("Bearer " + token).getBytes(StandardCharsets.UTF_8);
         this.jsonMapper = jsonMapper;
+        this.metrics = metrics;
     }
 
     @Override
@@ -58,6 +61,7 @@ public class InternalApiTokenFilter extends OncePerRequestFilter {
     }
 
     private void reject(HttpServletRequest request, HttpServletResponse response, String code) throws IOException {
+        metrics.internalApiRejected(code);
         log.warn("security.internal_api_auth_failed code={} method={} path={}", code, request.getMethod(), request.getRequestURI());
         response.setStatus(HttpStatus.UNAUTHORIZED.value());
         response.setContentType(MediaType.APPLICATION_JSON_VALUE);

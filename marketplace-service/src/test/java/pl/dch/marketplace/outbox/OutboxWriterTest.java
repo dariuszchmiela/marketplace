@@ -16,6 +16,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -25,7 +26,7 @@ class OutboxWriterTest {
 
     private final OutboxRepository repository = mock(OutboxRepository.class);
     private final JsonMapper jsonMapper = JsonMapper.builder().build();
-    private final OutboxWriter writer = new OutboxWriter(repository, jsonMapper);
+    private final OutboxWriter writer = new OutboxWriter(repository, jsonMapper, OutboxTracing.noop());
 
     @Test
     void writesAStableEnvelopeWithTheTypedPayload() {
@@ -35,7 +36,7 @@ class OutboxWriterTest {
         UUID eventId = writer.append("Order", "42", OrderEvents.ORDER_PAID, 1, payload);
 
         ArgumentCaptor<String> json = ArgumentCaptor.forClass(String.class);
-        verify(repository).insert(eq(eventId), eq("Order"), eq("42"), eq("OrderPaid"), eq(1), eq(2), json.capture(), any(Instant.class));
+        verify(repository).insert(eq(eventId), eq("Order"), eq("42"), eq("OrderPaid"), eq(1), eq(2), json.capture(), any(Instant.class), isNull());
         JsonNode message = jsonMapper.readTree(json.getValue());
         assertThat(message.get("eventId").asString()).isEqualTo(eventId.toString());
         assertThat(message.get("eventType").asString()).isEqualTo("OrderPaid");
@@ -59,7 +60,7 @@ class OutboxWriterTest {
         writer.append("Order", "7", OrderEvents.ORDER_CREATED, 1, created);
 
         ArgumentCaptor<String> json = ArgumentCaptor.forClass(String.class);
-        verify(repository).insert(any(), any(), any(), any(), anyInt(), anyInt(), json.capture(), any());
+        verify(repository).insert(any(), any(), any(), any(), anyInt(), anyInt(), json.capture(), any(), any());
         OrderEvents.OrderCreated back = jsonMapper.treeToValue(jsonMapper.readTree(json.getValue()).get("payload"),
                 OrderEvents.OrderCreated.class);
         // JSON numbers carry no scale (20.00 may come back as 20.0): money is compared by value, not equals().
@@ -72,7 +73,7 @@ class OutboxWriterTest {
     void publisherBackoffDoublesAndIsCapped() {
         OutboxPublisher publisher = new OutboxPublisher(repository, record -> { }, null,
                 new OutboxProperties.Publisher(false, Duration.ofSeconds(1), 10, Duration.ofSeconds(5),
-                        Duration.ofSeconds(1), Duration.ofSeconds(60)));
+                        Duration.ofSeconds(1), Duration.ofSeconds(60)), null, OutboxTracing.noop());
 
         assertThat(publisher.backoff(1)).isEqualTo(Duration.ofSeconds(1));
         assertThat(publisher.backoff(2)).isEqualTo(Duration.ofSeconds(2));

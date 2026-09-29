@@ -4,6 +4,7 @@ import java.net.ConnectException;
 import java.net.UnknownHostException;
 import java.net.http.HttpConnectTimeoutException;
 import java.net.http.HttpTimeoutException;
+import java.time.Duration;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -60,12 +61,15 @@ public class PaymentClient {
     private final CircuitBreaker circuitBreaker;
     private final Retry retry;
     private final boolean forwardScenarioHeader;
+    private final PaymentClientMetrics metrics;
 
-    public PaymentClient(RestClient restClient, CircuitBreaker circuitBreaker, Retry retry, boolean forwardScenarioHeader) {
+    public PaymentClient(RestClient restClient, CircuitBreaker circuitBreaker, Retry retry, boolean forwardScenarioHeader,
+                         PaymentClientMetrics metrics) {
         this.restClient = restClient;
         this.circuitBreaker = circuitBreaker;
         this.retry = retry;
         this.forwardScenarioHeader = forwardScenarioHeader;
+        this.metrics = metrics;
     }
 
     /**
@@ -75,6 +79,7 @@ public class PaymentClient {
      */
     public PaymentOutcome pay(RemotePayment.Request request, @Nullable String scenario) {
         requireNoTransaction();
+        long start = System.nanoTime();
         AtomicInteger attempts = new AtomicInteger();
         // Set when any attempt may have reached payment-service without a definitive answer.
         AtomicBoolean ambiguousAttempt = new AtomicBoolean();
@@ -99,12 +104,15 @@ public class PaymentClient {
             RemotePayment.Response response = decorate(attempt).get();
             log.info("payment.result orderId={} idempotencyKey={} paymentId={} status={} attempts={}",
                     request.orderId(), request.idempotencyKey(), response.paymentId(), response.status(), attempts.get());
+            metrics.record(PaymentClientMetrics.Operation.PAY, response.status() == RemotePayment.Status.SUCCEEDED
+                    ? PaymentClientMetrics.Result.SUCCESS : PaymentClientMetrics.Result.DECLINED, elapsedSince(start));
             return switch (response.status()) {
                 case SUCCEEDED -> new PaymentOutcome.Succeeded(response.paymentId());
                 case DECLINED -> new PaymentOutcome.Declined(response.paymentId());
             };
         } catch (RuntimeException ex) {
             String reason = describe(ex);
+            metrics.record(PaymentClientMetrics.Operation.PAY, PaymentClientMetrics.Result.of(ex), elapsedSince(start));
             boolean unknown = ambiguousAttempt.get() || !provesNotProcessed(ex);
             log.warn("payment.no_result orderId={} idempotencyKey={} attempts={} outcome={} reason=\"{}\"",
                     request.orderId(), request.idempotencyKey(), attempts.get(),
@@ -120,19 +128,23 @@ public class PaymentClient {
      */
     public Optional<RemotePayment.Response> findByIdempotencyKey(UUID idempotencyKey) {
         requireNoTransaction();
+        long start = System.nanoTime();
         Supplier<RemotePayment.Response> lookup = () -> restClient.get()
                 .uri("/api/payments/by-idempotency-key/{key}", idempotencyKey)
                 .retrieve()
                 .body(RemotePayment.Response.class);
         try {
             RemotePayment.Response response = decorate(lookup).get();
+            metrics.record(PaymentClientMetrics.Operation.LOOKUP, PaymentClientMetrics.Result.SUCCESS, elapsedSince(start));
             log.info("payment.lookup idempotencyKey={} paymentId={} status={}",
                     idempotencyKey, response.paymentId(), response.status());
             return Optional.of(response);
         } catch (HttpClientErrorException.NotFound ex) {
+            metrics.record(PaymentClientMetrics.Operation.LOOKUP, PaymentClientMetrics.Result.NOT_FOUND, elapsedSince(start));
             log.info("payment.lookup idempotencyKey={} result=NOT_FOUND", idempotencyKey);
             return Optional.empty();
         } catch (RuntimeException ex) {
+            metrics.record(PaymentClientMetrics.Operation.LOOKUP, PaymentClientMetrics.Result.of(ex), elapsedSince(start));
             log.warn("payment.lookup_failed idempotencyKey={} failure=\"{}\"", idempotencyKey, describe(ex));
             throw new MarketplaceException(ErrorCode.PAYMENT_SERVICE_UNAVAILABLE,
                     "Payment service is not available, try again later");
@@ -150,6 +162,10 @@ public class PaymentClient {
                 .body(request)
                 .retrieve()
                 .body(RemotePayment.Response.class);
+    }
+
+    private static Duration elapsedSince(long startNanos) {
+        return Duration.ofNanos(System.nanoTime() - startNanos);
     }
 
     private <T> Supplier<T> decorate(Supplier<T> call) {

@@ -20,6 +20,7 @@ import org.springframework.security.web.csrf.CsrfException;
 import org.springframework.stereotype.Component;
 import pl.dch.marketplace.common.ApiError;
 import pl.dch.marketplace.common.ErrorCode;
+import pl.dch.marketplace.observability.SecurityMetrics;
 import tools.jackson.databind.json.JsonMapper;
 
 /**
@@ -33,14 +34,17 @@ class SecurityErrorHandler implements AuthenticationEntryPoint, AccessDeniedHand
     private static final Logger log = LoggerFactory.getLogger(SecurityErrorHandler.class);
 
     private final JsonMapper jsonMapper;
+    private final SecurityMetrics metrics;
 
-    SecurityErrorHandler(JsonMapper jsonMapper) {
+    SecurityErrorHandler(JsonMapper jsonMapper, SecurityMetrics metrics) {
         this.jsonMapper = jsonMapper;
+        this.metrics = metrics;
     }
 
     @Override
     public void commence(HttpServletRequest request, HttpServletResponse response, AuthenticationException ex)
             throws IOException {
+        metrics.authenticationRequired();
         log.info("security.authentication_required method={} path={}", request.getMethod(), request.getRequestURI());
         write(response, request, HttpStatus.UNAUTHORIZED, ErrorCode.AUTHENTICATION_REQUIRED, "Please log in");
     }
@@ -49,6 +53,7 @@ class SecurityErrorHandler implements AuthenticationEntryPoint, AccessDeniedHand
     public void handle(HttpServletRequest request, HttpServletResponse response, AccessDeniedException ex)
             throws IOException {
         if (ex instanceof CsrfException) {
+            metrics.csrfRejected();
             log.info("security.csrf_rejected userId={} method={} path={}", currentUserId(), request.getMethod(),
                     request.getRequestURI());
             write(response, request, HttpStatus.FORBIDDEN, ErrorCode.CSRF_FAILED,

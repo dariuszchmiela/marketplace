@@ -16,6 +16,7 @@ import org.springframework.http.HttpStatus
 import org.springframework.http.MediaType
 import org.springframework.web.filter.OncePerRequestFilter
 import pl.dch.payment.api.ApiError
+import pl.dch.payment.observability.PaymentMetrics
 import tools.jackson.databind.json.JsonMapper
 
 /**
@@ -39,7 +40,11 @@ data class ServiceSecurityProperties(val serviceToken: String) {
  * A plain servlet filter is enough for one shared secret; real systems would rather use mTLS, workload identity
  * or OAuth2 client credentials (see docs/architecture.md).
  */
-class ServiceTokenFilter(properties: ServiceSecurityProperties, private val jsonMapper: JsonMapper) : OncePerRequestFilter() {
+class ServiceTokenFilter(
+    properties: ServiceSecurityProperties,
+    private val jsonMapper: JsonMapper,
+    private val metrics: PaymentMetrics,
+) : OncePerRequestFilter() {
 
     private val expected = "Bearer ${properties.serviceToken}".toByteArray(StandardCharsets.UTF_8)
 
@@ -57,6 +62,7 @@ class ServiceTokenFilter(properties: ServiceSecurityProperties, private val json
     }
 
     private fun reject(request: HttpServletRequest, response: HttpServletResponse, code: String, message: String) {
+        metrics.serviceAuthRejected(code)
         // Never log the header value itself.
         log.warn("security.service_auth_failed code={} method={} path={} remote={}",
             code, request.method, request.requestURI, request.remoteAddr)
@@ -76,12 +82,16 @@ class ServiceTokenFilter(properties: ServiceSecurityProperties, private val json
 class ServiceSecurityConfiguration {
 
     @Bean
-    fun serviceTokenFilter(properties: ServiceSecurityProperties, jsonMapper: JsonMapper): FilterRegistrationBean<ServiceTokenFilter> {
+    fun serviceTokenFilter(
+        properties: ServiceSecurityProperties,
+        jsonMapper: JsonMapper,
+        metrics: PaymentMetrics,
+    ): FilterRegistrationBean<ServiceTokenFilter> {
         if (properties.serviceToken.startsWith("dev-only-")) {
             LoggerFactory.getLogger(ServiceSecurityConfiguration::class.java)
                 .warn("security.dev_token_in_use: payment.security.service-token is the local development default; set PAYMENT_SERVICE_TOKEN")
         }
-        return FilterRegistrationBean(ServiceTokenFilter(properties, jsonMapper)).apply {
+        return FilterRegistrationBean(ServiceTokenFilter(properties, jsonMapper, metrics)).apply {
             addUrlPatterns("/api/*")
             order = 0
         }

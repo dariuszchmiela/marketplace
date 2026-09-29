@@ -41,6 +41,17 @@ spring:
         request.timeout.ms: 5000
         # How long send() may block waiting for metadata when the broker is unreachable.
         max.block.ms: 5000
+    template:
+      # Producer spans + the W3C "traceparent" header on every record: the consumer continues the checkout's trace
+      # (restored from the outbox row by OutboxTracing). Also times each send (spring.kafka.template metric).
+      observation-enabled: true
+
+server:
+  tomcat:
+    mbeanregistry:
+      # Exposes Tomcat's request thread pool as metrics (tomcat_threads_busy_threads / _config_max_threads): the
+      # direct view of "all request threads are waiting for a slow downstream".
+      enabled: true
 
 springdoc:
   swagger-ui:
@@ -92,6 +103,10 @@ logging:
   level:
     # The Kafka clients log their complete configuration at INFO on every start.
     org.apache.kafka: WARN
+  pattern:
+    # traceId/spanId from the MDC on every log line (empty outside a traced request/task), key=value like the messages.
+    # Search one trace id to get every line of a checkout across marketplace, payment-service and order-activity.
+    correlation: "[traceId=%X{traceId:-} spanId=%X{spanId:-}] "
 
 app:
   security:
@@ -105,3 +120,83 @@ app:
     cors:
       # Exact origins only (credentials are allowed, so never "*"). Comma-separated.
       allowed-origins: ${APP_CORS_ALLOWED_ORIGINS:http://localhost:5173}
+  management:
+    # Bearer token for /actuator/** (except the public health probes), sent by Prometheus when scraping.
+    # LOCAL DEVELOPMENT default only (a warning is logged); set MANAGEMENT_TOKEN anywhere else.
+    token: ${MANAGEMENT_TOKEN:dev-only-management-token}
+
+# --- Phase 6: management endpoints, metrics, tracing ------------------------------------------------------------
+management:
+  endpoints:
+    web:
+      exposure:
+        # Explicit allow-list. env, configprops, beans, heapdump, threaddump, loggers, ... are NOT exposed over HTTP:
+        # they leak configuration or process memory. Dumps are taken locally with jcmd (docs/production-diagnostics.md).
+        include: health, info, metrics, prometheus
+  endpoint:
+    health:
+      # Public /actuator/health: UP/DOWN only. Details only in the token-protected "dependencies" group.
+      show-details: never
+      show-components: never
+      status:
+        # DEGRADED (a dependency impaired, the service still usable: payment circuit open, outbox lagging) ranks
+        # BELOW UP here, so it never turns the public health DOWN. Only a real local failure (database) does.
+        order: down, out-of-service, up, degraded, unknown
+      probes:
+        # /actuator/health/liveness and /actuator/health/readiness
+        enabled: true
+      group:
+        liveness:
+          # "Is the process alive?" Never depends on other systems: a DB outage must not restart every instance.
+          include: livenessState
+        readiness:
+          # "Should the load balancer send traffic here?" Only what every request needs: the database.
+          # Kafka (outbox buffers events) and payment-service (checkout degrades safely) are deliberately NOT here.
+          include: readinessState, db
+        dependencies:
+          # Operator view, protected by the management token: every dependency with details. Passive checks only.
+          include: db, outbox, paymentService
+          show-details: always
+          show-components: always
+          status:
+            # The operator view shows the worst dependency state; still 200 for DEGRADED, 503 only for DOWN.
+            order: down, out-of-service, degraded, unknown, up
+  info:
+    java:
+      enabled: true
+    os:
+      enabled: true
+  metrics:
+    tags:
+      # Constant, bounded tag on every meter; Prometheus adds instance/job itself.
+      application: ${spring.application.name}
+    distribution:
+      # Histogram buckets (not client-side percentiles): Prometheus computes p50/p95/p99 across instances and time
+      # windows with histogram_quantile(). Only for the latency timers we actually discuss, not for every meter.
+      percentiles-histogram:
+        http.server.requests: true
+        http.client.requests: true
+      minimum-expected-value:
+        http.server.requests: 1ms
+        http.client.requests: 1ms
+      maximum-expected-value:
+        http.server.requests: 30s
+        http.client.requests: 30s
+  tracing:
+    sampling:
+      # Training setup: every request is traced. Production typically samples (e.g. 0.1) or samples at a collector.
+      probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
+    propagation:
+      # W3C trace context (traceparent header) in and out.
+      type: w3c
+    export:
+      otlp:
+        # Spans are always created and propagated (trace ids in logs, W3C headers to payment-service/Kafka), but only
+        # exported when a tracing backend runs: docker compose --profile observability up -d + TRACING_EXPORT_ENABLED=true.
+        # (Not management.tracing.export.enabled: in Boot 4 that switch also turns off propagation.)
+        enabled: ${TRACING_EXPORT_ENABLED:false}
+  opentelemetry:
+    tracing:
+      export:
+        otlp:
+          endpoint: ${OTLP_TRACING_ENDPOINT:http://localhost:4318/v1/traces}

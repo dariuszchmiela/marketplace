@@ -1,5 +1,6 @@
 package pl.dch.payment.payments
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import java.math.BigDecimal
 import java.time.Clock
 import java.time.Instant
@@ -10,12 +11,13 @@ import java.util.concurrent.TimeUnit
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
+import pl.dch.payment.observability.PaymentMetrics
 
 class PaymentServiceTest {
 
     private val repository = InMemoryPaymentRepository()
     private val clock = Clock.fixed(Instant.parse("2026-09-29T10:00:00Z"), ZoneOffset.UTC)
-    private val service = PaymentService(repository, clock)
+    private val service = PaymentService(repository, clock, PaymentMetrics(SimpleMeterRegistry()))
 
     private val command = CreatePaymentCommand(orderId = 7, amount = BigDecimal("129.50"), currency = "PLN", idempotencyKey = "key-1")
 

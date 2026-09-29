@@ -34,16 +34,21 @@ public class OutboxPublisher {
     private final EventSender sender;
     private final TransactionTemplate transactionTemplate;
     private final OutboxProperties.Publisher properties;
+    private final OutboxMetrics metrics;
+    private final OutboxTracing tracing;
 
     public OutboxPublisher(OutboxRepository repository, EventSender sender, TransactionTemplate transactionTemplate,
-                           OutboxProperties.Publisher properties) {
+                           OutboxProperties.Publisher properties, OutboxMetrics metrics, OutboxTracing tracing) {
         this.repository = repository;
         this.sender = sender;
         this.transactionTemplate = transactionTemplate;
         this.properties = properties;
+        this.metrics = metrics;
+        this.tracing = tracing;
     }
 
     public BatchResult publishPendingBatch() {
+        long start = System.nanoTime();
         BatchResult result = transactionTemplate.execute(status -> {
             var batch = repository.claimBatch(properties.batchSize());
             int published = 0;
@@ -51,8 +56,9 @@ public class OutboxPublisher {
                 log.info("outbox.publish_attempt eventId={} eventType={} aggregateId={} attempt={}",
                         record.eventId(), record.eventType(), record.aggregateId(), record.attemptCount() + 1);
                 try {
-                    sender.send(record);
+                    tracing.observePublish(record, () -> sender.send(record));
                 } catch (RuntimeException ex) {
+                    metrics.failed(record.eventType());
                     Duration retryAfter = backoff(record.attemptCount() + 1);
                     repository.markFailed(record.id(), ex.getMessage(), retryAfter);
                     log.warn("outbox.publish_failed eventId={} eventType={} aggregateId={} attempt={} retryAfterMs={} error=\"{}\"",
@@ -61,12 +67,14 @@ public class OutboxPublisher {
                     return new BatchResult(batch.size(), published, 1);
                 }
                 repository.markPublished(record.id());
+                metrics.published(record.eventType());
                 published++;
                 log.info("outbox.published eventId={} eventType={} aggregateId={} sequence={}",
                         record.eventId(), record.eventType(), record.aggregateId(), record.sequence());
             }
             return new BatchResult(batch.size(), published, 0);
         });
+        metrics.batch(result, Duration.ofNanos(System.nanoTime() - start));
         return result;
     }
 

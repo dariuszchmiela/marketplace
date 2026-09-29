@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -55,6 +56,7 @@ class CheckoutServiceTest {
 
     private Order order;
     private OrderResponse orderResponse;
+    private SimpleMeterRegistry meterRegistry;
 
     @BeforeEach
     void setUp() {
@@ -62,7 +64,9 @@ class CheckoutServiceTest {
                 List.of(new OrderLine(1L, "Keyboard", new BigDecimal("349.99"), 2)), Instant.now());
         ReflectionTestUtils.setField(order, "id", 5L);
         orderResponse = OrderResponse.from(order);
-        checkoutService = new CheckoutService(orderPlacement, paymentClient, orderPaymentUpdater);
+        meterRegistry = new SimpleMeterRegistry();
+        checkoutService = new CheckoutService(orderPlacement, paymentClient, orderPaymentUpdater,
+                new CheckoutMetrics(meterRegistry));
     }
 
     @Test
@@ -94,6 +98,7 @@ class CheckoutServiceTest {
         assertThat(result.created()).isFalse();
         assertThat(result.order()).isEqualTo(orderResponse);
         verifyNoInteractions(paymentClient, orderPaymentUpdater);
+        assertThat(meterRegistry.get("marketplace.checkout.total").tag("result", "REPLAYED").counter().count()).isEqualTo(1);
     }
 
     @Test
@@ -131,6 +136,9 @@ class CheckoutServiceTest {
                 .isInstanceOf(MarketplaceException.class)
                 .extracting("code").isEqualTo(ErrorCode.CONCURRENT_STOCK_CHANGE);
         verifyNoInteractions(paymentClient, orderPaymentUpdater);
+        assertThat(meterRegistry.get("marketplace.stock.conflict").counter().count()).isEqualTo(1);
+        assertThat(meterRegistry.get("marketplace.checkout.total").tag("result", "STOCK_CONFLICT").counter().count())
+                .isEqualTo(1);
     }
 
     @Test

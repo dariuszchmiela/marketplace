@@ -38,6 +38,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import pl.dch.marketplace.common.ErrorCode;
 import pl.dch.marketplace.common.MarketplaceException;
+import pl.dch.marketplace.observability.SecurityMetrics;
 
 /**
  * JSON authentication endpoints for the React app. All POSTs need a CSRF token (fetch it with
@@ -80,13 +81,16 @@ class AuthController {
     private final SessionAuthenticationStrategy sessionAuthenticationStrategy;
     private final SecurityContextRepository securityContextRepository;
     private final LogoutHandler logoutHandler;
+    private final SecurityMetrics securityMetrics;
     private final SecurityContextHolderStrategy contextHolder = SecurityContextHolder.getContextHolderStrategy();
 
     AuthController(UserRegistrationService registration,
                    AuthenticationManager authenticationManager,
                    SessionAuthenticationStrategy sessionAuthenticationStrategy,
                    SecurityContextRepository securityContextRepository,
-                   CsrfTokenRepository csrfTokenRepository) {
+                   CsrfTokenRepository csrfTokenRepository,
+                   SecurityMetrics securityMetrics) {
+        this.securityMetrics = securityMetrics;
         this.registration = registration;
         this.authenticationManager = authenticationManager;
         this.sessionAuthenticationStrategy = sessionAuthenticationStrategy;
@@ -119,6 +123,7 @@ class AuthController {
     @PostMapping("/login")
     UserResponse login(@Valid @RequestBody CredentialsRequest body, HttpServletRequest request, HttpServletResponse response) {
         if (body.password().getBytes(StandardCharsets.UTF_8).length > UserRegistrationService.MAX_PASSWORD_BYTES) {
+            securityMetrics.loginFailed();
             throw invalidCredentials();   // can never match a stored password
         }
         Authentication result;
@@ -127,11 +132,13 @@ class AuthController {
                     UsernamePasswordAuthenticationToken.unauthenticated(EmailAddress.normalize(body.email()), body.password()));
         } catch (AuthenticationException ex) {
             log.info("auth.login_failed reason={}", ex.getClass().getSimpleName());
+            securityMetrics.loginFailed();
             throw invalidCredentials();
         }
         AuthenticatedUser user = ((AppUserDetailsService.AppUserDetails) result.getPrincipal()).authenticatedUser();
         establishSession(user, request, response);
         log.info("auth.login_succeeded userId={}", user.userId());
+        securityMetrics.loginSucceeded();
         return UserResponse.from(user);
     }
 

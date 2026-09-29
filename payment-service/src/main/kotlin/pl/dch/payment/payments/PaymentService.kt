@@ -4,6 +4,7 @@ import java.time.Clock
 import java.util.UUID
 import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
+import pl.dch.payment.observability.PaymentMetrics
 
 /**
  * Business logic of the payment provider. It knows nothing about failure simulation:
@@ -13,6 +14,7 @@ import org.springframework.stereotype.Service
 class PaymentService(
     private val repository: InMemoryPaymentRepository,
     private val clock: Clock,
+    private val metrics: PaymentMetrics,
 ) {
 
     /**
@@ -40,6 +42,7 @@ class PaymentService(
             )
             throw IdempotencyKeyConflictException(command.idempotencyKey)
         }
+        metrics.payment(payment.status, result.created)
         log.info(
             "payment.{} paymentId={} orderId={} status={} amount={} currency={} idempotencyKey={}",
             if (result.created) "created" else "replayed",

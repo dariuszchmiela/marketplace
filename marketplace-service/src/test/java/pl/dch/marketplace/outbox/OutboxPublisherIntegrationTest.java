@@ -61,6 +61,12 @@ class OutboxPublisherIntegrationTest extends IntegrationTestBase {
     @Autowired
     private KafkaConnectionDetails kafka;
 
+    @Autowired
+    private OutboxMetrics outboxMetrics;
+
+    @Autowired
+    private OutboxTracing outboxTracing;
+
     @BeforeEach
     void forgetRowsOfOtherTests() {
         // Other test classes leave pending rows behind (their publisher never ran). Mark them as handled so
@@ -219,7 +225,7 @@ class OutboxPublisherIntegrationTest extends IntegrationTestBase {
                 bothClaimed.countDown();
                 awaitLatch(bothClaimed);
             }
-        }, new TransactionTemplate(transactionManager), config);
+        }, new TransactionTemplate(transactionManager), config, outboxMetrics, outboxTracing);
     }
 
     private List<String> appendEventsForNewAggregates(int count) {
@@ -235,7 +241,8 @@ class OutboxPublisherIntegrationTest extends IntegrationTestBase {
     }
 
     private OutboxPublisher publisherWith(OutboxRepository outboxRepository, EventSender sender) {
-        return new OutboxPublisher(outboxRepository, sender, new TransactionTemplate(transactionManager), properties.publisher());
+        return new OutboxPublisher(outboxRepository, sender, new TransactionTemplate(transactionManager), properties.publisher(),
+                outboxMetrics, outboxTracing);
     }
 
     private long paidOrder() throws Exception {

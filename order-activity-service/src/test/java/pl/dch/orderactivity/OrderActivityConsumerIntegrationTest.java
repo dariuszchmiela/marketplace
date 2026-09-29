@@ -20,7 +20,10 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.kafka.autoconfigure.KafkaConnectionDetails;
+import org.springframework.boot.micrometer.metrics.test.autoconfigure.AutoConfigureMetrics;
+import org.springframework.boot.micrometer.tracing.test.autoconfigure.AutoConfigureTracing;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -39,6 +42,10 @@ import static pl.dch.orderactivity.TestEvents.withSchemaVersion;
  * outbox publisher does (key = order id), and the test waits (bounded) for the projection to catch up.
  */
 @SpringBootTest
+// Production-like observability (Prometheus registry, real tracing); shares its context with ConsumerObservabilityIntegrationTest.
+@AutoConfigureMockMvc
+@AutoConfigureMetrics
+@AutoConfigureTracing
 @Import(TestcontainersConfiguration.class)
 class OrderActivityConsumerIntegrationTest {
 

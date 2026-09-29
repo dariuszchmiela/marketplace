@@ -5,6 +5,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import pl.dch.orderactivity.observability.OrderEventMetrics;
 import tools.jackson.databind.json.JsonMapper;
 
 @Configuration
@@ -12,13 +13,13 @@ class InternalApiSecurityConfiguration {
 
     @Bean
     FilterRegistrationBean<InternalApiTokenFilter> internalApiTokenFilter(
-            @Value("${order-activity.security.api-token}") String token, JsonMapper jsonMapper) {
+            @Value("${order-activity.security.api-token}") String token, JsonMapper jsonMapper, OrderEventMetrics metrics) {
         if (token.startsWith("dev-only-")) {
             LoggerFactory.getLogger(InternalApiSecurityConfiguration.class).warn(
                     "security.dev_token_in_use: order-activity.security.api-token is the local development default; set ORDER_ACTIVITY_API_TOKEN");
         }
         FilterRegistrationBean<InternalApiTokenFilter> registration =
-                new FilterRegistrationBean<>(new InternalApiTokenFilter(token, jsonMapper));
+                new FilterRegistrationBean<>(new InternalApiTokenFilter(token, jsonMapper, metrics));
         registration.addUrlPatterns("/api/*");
         registration.setOrder(0);
         return registration;

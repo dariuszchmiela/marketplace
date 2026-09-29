@@ -1,6 +1,7 @@
 package pl.dch.orderactivity.kafka;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.slf4j.Logger;
@@ -12,6 +13,7 @@ import org.springframework.stereotype.Component;
 import pl.dch.orderactivity.activity.OrderActivityProjector;
 import pl.dch.orderactivity.event.OrderEvent;
 import pl.dch.orderactivity.event.OrderEventParser;
+import pl.dch.orderactivity.observability.OrderEventMetrics;
 
 /**
  * Consumes order events. The listener itself does no business work: parse (permanent failure if invalid),
@@ -26,10 +28,12 @@ class OrderEventListener {
 
     private final OrderEventParser parser;
     private final OrderActivityProjector projector;
+    private final OrderEventMetrics metrics;
 
-    OrderEventListener(OrderEventParser parser, OrderActivityProjector projector) {
+    OrderEventListener(OrderEventParser parser, OrderActivityProjector projector, OrderEventMetrics metrics) {
         this.parser = parser;
         this.projector = projector;
+        this.metrics = metrics;
     }
 
     @KafkaListener(topics = "${order-activity.topics.order-events}", groupId = "${spring.kafka.consumer.group-id}")
@@ -38,8 +42,20 @@ class OrderEventListener {
         log.info("event.received eventId={} eventType={} key={} topic={} partition={} offset={} attempt={}",
                 header(record, "eventId"), header(record, "eventType"), record.key(), record.topic(),
                 record.partition(), record.offset(), deliveryAttempt == null ? 1 : deliveryAttempt);
-        OrderEvent event = parser.parse(record.value());
-        projector.apply(event);
+        long start = System.nanoTime();
+        String eventType = header(record, "eventType");
+        try {
+            OrderEvent event = parser.parse(record.value());
+            OrderActivityProjector.Result result = projector.apply(event);
+            metrics.handled(eventType, OrderEventMetrics.Result.valueOf(result.name()), elapsedSince(start));
+        } catch (RuntimeException ex) {
+            metrics.handled(eventType, OrderEventMetrics.Result.FAILED, elapsedSince(start));
+            throw ex;
+        }
+    }
+
+    private static Duration elapsedSince(long startNanos) {
+        return Duration.ofNanos(System.nanoTime() - startNanos);
     }
 
     private static String header(ConsumerRecord<String, String> record, String name) {

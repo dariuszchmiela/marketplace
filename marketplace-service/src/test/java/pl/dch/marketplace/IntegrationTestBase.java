@@ -14,6 +14,8 @@ import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.micrometer.metrics.test.autoconfigure.AutoConfigureMetrics;
+import org.springframework.boot.micrometer.tracing.test.autoconfigure.AutoConfigureTracing;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Import;
@@ -48,11 +50,16 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 // (a test class can switch it on with @TestPropertySource).
 @SpringBootTest(properties = "outbox.publisher.enabled=false")
 @AutoConfigureMockMvc
+// Production-like observability in tests: the Prometheus registry and real tracing (spans, W3C propagation), which
+// @SpringBootTest would otherwise replace with a simple registry and no-op tracing. Spans are not exported.
+@AutoConfigureMetrics
+@AutoConfigureTracing
 @Import(TestcontainersConfiguration.class)
 public abstract class IntegrationTestBase {
 
     protected static final String IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
     protected static final String TEST_PASSWORD = "correct horse battery staple";
+    protected static final String MANAGEMENT_TOKEN = "test-management-token";
 
     /** Shared by all integration tests (like the Spring context and the database container). */
     protected static final FakePaymentServer PAYMENT_SERVICE = FakePaymentServer.start();
@@ -68,6 +75,10 @@ public abstract class IntegrationTestBase {
         registry.add("payment.client.retry.initial-backoff", () -> "10ms");
         registry.add("outbox.publisher.initial-retry-backoff", () -> "50ms");
         registry.add("outbox.publisher.send-timeout", () -> "12s");
+        registry.add("app.management.token", () -> MANAGEMENT_TOKEN);
+        // Backlog gauges read the database on every scrape in tests (no 5s cache), so assertions see changes at once.
+        registry.add("outbox.metrics.snapshot-max-age", () -> "0s");
+        registry.add("app.metrics.session-snapshot-max-age", () -> "0s");
     }
 
     /**

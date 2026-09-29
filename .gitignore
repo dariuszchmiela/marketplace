@@ -31,3 +31,9 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Diagnostics (Phase 6): recordings, heap dumps and GC logs are never committed (large; may contain secrets/PII)
+*.jfr
+*.hprof
+*.gc.log
+gc.log

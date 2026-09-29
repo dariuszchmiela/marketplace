@@ -1,12 +1,12 @@
 # Interview map
 
-Where each interview topic can be demonstrated in the **current** code (Phases 1–5).
+Where each interview topic can be demonstrated in the **current** code (Phases 1–6).
 Topics for later phases are listed at the bottom as planned only. They have no code yet.
 
 Paths are relative to `marketplace-service/src/main/java/pl/dch/marketplace/` (backend),
 `payment-service/src/main/kotlin/pl/dch/payment/` (Kotlin service), `order-activity-service/src/main/java/pl/dch/orderactivity/`
 (consumer)
-and `marketplace-web/src/` (frontend) unless stated otherwise. Test-only paths (`concurrency/`, `lab/`) are under
+and `marketplace-web/src/` (frontend) unless stated otherwise. Test-only paths (`concurrency/`, `lab/`, `productionlab/`) are under
 `marketplace-service/src/test/java/pl/dch/marketplace/`.
 
 ## Java / backend
@@ -127,6 +127,39 @@ Marketplace paths under `marketplace-service/src/main/java/pl/dch/marketplace/`;
 | Secrets and logging | `PaymentClientProperties.toString`, Kotlin `ServiceSecurityProperties.toString`, `CredentialsRequest.toString`, `auth.*`/`security.*` log lines; `OutputCaptureExtension` assertions | Never log passwords, hashes, cookies, CSRF or service tokens; user id instead of email. |
 | Kafka security boundary | `docker-compose.yml` (PLAINTEXT), `docs/architecture.md` → Kafka security boundary | Not implemented locally on purpose; production: TLS + SASL/workload identity + ACLs per service (produce vs consume vs DLT). |
 
+## Observability and production diagnostics (Phase 6)
+
+Runbook, playbooks and measured numbers: `docs/production-diagnostics.md`. Lab paths are under
+`marketplace-service/src/test/java/pl/dch/marketplace/productionlab/` (run with `mvn test -Pproduction-lab`).
+
+| Topic | Where | What to talk about |
+|---|---|---|
+| Actuator and the management security boundary | `observability/ManagementSecurityConfiguration` (separate stateless Spring Security chain, `@Order(1)`); payment `observability/ManagementTokenFilter.kt`; order-activity `observability/ManagementSecurityConfiguration`; `ManagementEndpointsIntegrationTest` | Public status-only probes vs token-protected metrics; exposure allow-list; why env/heapdump/threaddump are never exposed; token vs internal management port; why no CSRF on a bearer-token chain. |
+| Micrometer: meters, tags, cardinality | `checkout/CheckoutMetrics`, `payment/PaymentClientMetrics`, `outbox/OutboxMetrics`, order-activity `observability/OrderEventMetrics`; `BusinessMetricsIntegrationTest.noIdentifierOrSecretEverBecomesAMetricLabel` | Counter/timer/gauge/summary; bounded enum tags; URI templates; external values (`eventType` header) normalized to `other`; every label combination is a time series. |
+| Pre-registered counters | constructors of the metrics classes above | A series born with value 1 is invisible to `increase()` — found live (`circuit_open` showed 0 while the circuit rejected 13 calls). Timers stay lazy (histogram buckets cost series). |
+| Prometheus | `observability/prometheus/prometheus.yml`, `docker-compose.yml` (profile `observability`) | Pull model, scrape auth, `rate()`, `increase()`, `histogram_quantile()`, why counters reset. |
+| p50 / p95 / p99 | `management.metrics.distribution.*` in `application.yaml`; `docs/production-diagnostics.md` §4; `SlowPaymentDownstreamLabTest` | Averages hide the tail: 5% slow payments → mean ×2.4, p99 ×30 (measured). Histogram buckets (aggregatable, estimated) vs client-side percentiles (exact, not aggregatable). |
+| Grafana | `observability/grafana/dashboards/marketplace-diagnostics.json`, provisioning | A dashboard organised by diagnostic questions (traffic/latency, checkout/payment, resources, async flow, security). |
+| Health: liveness vs readiness vs dependencies | `management.endpoint.health.*` in the three `application.yaml`; `payment/PaymentServiceHealthIndicator`, `outbox/OutboxHealthIndicator`, order-activity `KafkaConsumerHealthIndicator` | Passive checks, no probes (cascading failures); DEGRADED ranked below UP; why payment-service/Kafka are not readiness conditions. Verified during a real Kafka outage. |
+| Distributed tracing, W3C trace context | `PaymentClientConfiguration.restClient` (`observationRegistry`), `spring.kafka.*.observation-enabled`; `TracePropagationIntegrationTest`, `ConsumerObservabilityIntegrationTest` | traceparent format, spans vs traces, sampling, OTLP export; Boot 4 pitfall: `management.tracing.export.enabled=false` disables propagation too. |
+| Tracing across the outbox | `outbox/OutboxTracing` (`ReceiverContext` with the row as carrier), `OutboxWriter`, `V7__outbox_observability.sql` | Storing the parent context vs a new linked trace; the time gap as visible outbox lag; not putting trace data into the event schema. |
+| Log correlation | `logging.pattern.correlation` (all services) | traceId/spanId via MDC; one grep across three services' logs; still no secrets in logs. |
+| Outbox lag vs consumer lag vs projection correctness | `OutboxMetrics` gauges, Kafka `records_lag`, `OrderEventMetrics` | Three different questions; lag 0 with a growing DLT still loses data. |
+| Outbox publisher lock time | `outbox.batch.duration`, `outbox.publish` timer; `docs/production-diagnostics.md` §7 | Transaction + row locks held while waiting for Kafka acks; when a lease/claim design pays off. |
+| Load testing and coordinated omission | `tools/production-lab/LoadGenerator.java` | Closed vs open loop; why the measured tail is optimistic; warm-up; not a benchmark. |
+| HikariCP pool exhaustion | `productionlab/HikariPoolExhaustionLabTest`; live finding (Spring Session JDBC → 10/10 active, 10 pending) | Threads ≠ connections; pending and acquire time before errors; connectionTimeout turns queueing into failures; sizing. |
+| Downstream capacity limits | `productionlab/HttpDownstreamLimitLabTest` | More callers = more queueing, same throughput; virtual threads do not add downstream capacity. |
+| Slow downstream, timeouts, circuit breaker | `productionlab/SlowPaymentDownstreamLabTest`; live run with the payment `SLOW` scenario | Timeouts cap the tail; the circuit breaker protects threads, not the payment; PAYMENT_UNKNOWN vs fail fast. |
+| Executor saturation and backpressure | `productionlab/ExecutorSaturationLabTest` (`ExecutorServiceMetrics`) | Unbounded queue hides overload as latency; AbortPolicy (shed load) vs CallerRunsPolicy (throttle the producer). |
+| Blocked threads and thread dumps | `productionlab/LockContentionLabTest` (`-Dlab.hold=60s`) | BLOCKED vs WAITING vs TIMED_WAITING; `waiting to lock` / `- locked` with the same address; `ThreadMXBean` lock owner. |
+| Virtual-thread diagnostics | `productionlab/VirtualThreadDiagnosticsLabTest` | `Thread.print` does not show parked virtual threads, `Thread.dump_to_file -format=json` does; carriers ≈ cores; capacity unchanged. |
+| CPU-bound work | `productionlab/CpuBoundLabTest` | Virtual threads are not a CPU optimisation (same wall time and CPU time). |
+| Heap retention, leaks, unbounded caches | `productionlab/HeapRetentionLabTest`, `tools/production-lab/MemoryDemo.java` | Heap after GC vs heap used; `GC.class_histogram`; `ConcurrentHashMap` as a cache vs LRU/TTL; OOM with a heap dump; G1 humongous objects (OOM after 30 MiB of 1 MiB arrays in 64 MiB). |
+| GC and allocation rate | `productionlab/GcAndJfrLabTest`, `-Xlog:gc*` commands | Young collections, pause times, GC pressure vs leak. |
+| JFR | `GcAndJfrLabTest` (programmatic `Recording` + `RecordingFile`), `jcmd JFR.start/dump/stop` runbook | Event categories; hot methods from ExecutionSample; live findings: BCrypt dominates CPU samples, ~1,300 hidden exceptions from Spring Data's `@EntityGraph` named-graph lookup. |
+| jcmd | `productionlab/ProductionLab.jcmd` (DiagnosticCommand MBean); runbook | VM.version/flags, GC.heap_info, GC.class_histogram, Thread.print, GC.heap_dump caution (size, pause, sensitive data). |
+| Production diagnosis sequence | `docs/production-diagnostics.md` §9, §11 | Symptom → waiting or working → saturated resource → JVM evidence → one trace → fix → measure again. |
+
 ## Frontend
 
 | Topic | Where | What to talk about |
@@ -154,4 +187,5 @@ Listed only to show where they will attach. Nothing below is implemented.
 | Server-side retry of optimistic conflicts, conditional atomic stock update, stock reservation | not planned yet (alternatives documented in architecture.md) |
 | JMM details (happens-before, `volatile`, safe publication) beyond what the lab uses | later |
 | Kafka-based payment commands, sagas, CDC / Debezium, Schema Registry | not planned yet |
-| Heap, GC, connection pool diagnostics | Phase 6 |
+| Alerting rules, SLOs / error budgets, log aggregation, continuous profiling | not planned yet (Phase 6 covers metrics, traces, dashboards and JVM tooling) |
+| AI shopping assistant | Phase 7 (optional) |
