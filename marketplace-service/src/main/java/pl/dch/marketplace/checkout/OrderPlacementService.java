@@ -20,6 +20,7 @@ import pl.dch.marketplace.order.Order;
 import pl.dch.marketplace.order.OrderLine;
 import pl.dch.marketplace.order.OrderRepository;
 import pl.dch.marketplace.order.OrderResponse;
+import pl.dch.marketplace.order.events.OrderEvents;
 import pl.dch.marketplace.product.Product;
 import pl.dch.marketplace.product.ProductRepository;
 import pl.dch.marketplace.session.SessionId;
@@ -37,13 +38,16 @@ public class OrderPlacementService {
     private final CartRepository cartRepository;
     private final ProductRepository productRepository;
     private final OrderRepository orderRepository;
+    private final OrderEvents orderEvents;
 
     public OrderPlacementService(CartRepository cartRepository,
                                  ProductRepository productRepository,
-                                 OrderRepository orderRepository) {
+                                 OrderRepository orderRepository,
+                                 OrderEvents orderEvents) {
         this.cartRepository = cartRepository;
         this.productRepository = productRepository;
         this.orderRepository = orderRepository;
+        this.orderEvents = orderEvents;
     }
 
     /**
@@ -90,6 +94,8 @@ public class OrderPlacementService {
 
         Order order = orderRepository.save(Order.create(sessionId.value(), checkoutIdempotencyKey, lines, now()));
         cart.clear();
+        // Outbox row in this same transaction: the event exists if and only if the order does. No Kafka here.
+        orderEvents.orderCreated(order);
         return PlacedOrder.created(order);
     }
 

@@ -24,6 +24,7 @@ import pl.dch.marketplace.order.OrderLine;
 import pl.dch.marketplace.order.OrderRepository;
 import pl.dch.marketplace.order.OrderResponse;
 import pl.dch.marketplace.order.OrderStatus;
+import pl.dch.marketplace.order.events.OrderEvents;
 import pl.dch.marketplace.product.Product;
 import pl.dch.marketplace.product.ProductRepository;
 import pl.dch.marketplace.session.SessionId;
@@ -53,6 +54,9 @@ class OrderPlacementServiceTest {
     @Mock
     private OrderRepository orderRepository;
 
+    @Mock
+    private OrderEvents orderEvents;
+
     private OrderPlacementService orderPlacement;
 
     private final Product keyboard = product(1L, "Keyboard", "349.99", 10);
@@ -61,7 +65,7 @@ class OrderPlacementServiceTest {
 
     @BeforeEach
     void setUp() {
-        orderPlacement = new OrderPlacementService(cartRepository, productRepository, orderRepository);
+        orderPlacement = new OrderPlacementService(cartRepository, productRepository, orderRepository, orderEvents);
         givenCatalog(keyboard, mouse, cable);
         when(orderRepository.save(any(Order.class))).thenAnswer(invocation -> invocation.getArgument(0));
     }
@@ -152,6 +156,7 @@ class OrderPlacementServiceTest {
             assertThat(line.quantity()).isEqualTo(2);
         });
         assertThat(response.total()).isEqualByComparingTo("1088.48");
+        verify(orderEvents).orderCreated(order);
 
         assertThat(keyboard.getAvailableQuantity()).isEqualTo(8);
         assertThat(mouse.getAvailableQuantity()).isZero();
@@ -171,6 +176,7 @@ class OrderPlacementServiceTest {
         OrderPlacementService.PlacedOrder placed = orderPlacement.placeOrder(SESSION, CHECKOUT_KEY);
 
         assertThat(placed.created()).isFalse();
+        verify(orderEvents, never()).orderCreated(any());
         assertThat(placed.paymentIdempotencyKey()).isEqualTo(existing.getPaymentIdempotencyKey());
         verify(orderRepository, never()).save(any());
         assertThat(cart.quantityOf(1L)).isEqualTo(2);
@@ -182,6 +188,7 @@ class OrderPlacementServiceTest {
                 .isInstanceOf(MarketplaceException.class)
                 .extracting("code").isEqualTo(expected);
         verify(orderRepository, never()).save(any());
+        verify(orderEvents, never()).orderCreated(any());
     }
 
     private void givenCart(Cart cart) {

@@ -38,7 +38,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * Tests isolate themselves by using a fresh session id and their own products,
  * so no database cleanup between tests is needed.
  */
-@SpringBootTest
+// No background outbox polling: outbox tests trigger publication explicitly and deterministically
+// (a test class can switch it on with @TestPropertySource).
+@SpringBootTest(properties = "outbox.publisher.enabled=false")
 @AutoConfigureMockMvc
 @Import(TestcontainersConfiguration.class)
 public abstract class IntegrationTestBase {
@@ -55,6 +57,8 @@ public abstract class IntegrationTestBase {
         // Short values keep the timeout and retry tests fast.
         registry.add("payment.client.read-timeout", () -> "500ms");
         registry.add("payment.client.retry.initial-backoff", () -> "10ms");
+        registry.add("outbox.publisher.initial-retry-backoff", () -> "50ms");
+        registry.add("outbox.publisher.send-timeout", () -> "12s");
     }
 
     @Autowired

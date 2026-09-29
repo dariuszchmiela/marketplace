@@ -1,10 +1,11 @@
 # Interview map
 
-Where each interview topic can be demonstrated in the **current** code (Phases 1–3).
+Where each interview topic can be demonstrated in the **current** code (Phases 1–4).
 Topics for later phases are listed at the bottom as planned only. They have no code yet.
 
 Paths are relative to `marketplace-service/src/main/java/pl/dch/marketplace/` (backend),
-`payment-service/src/main/kotlin/pl/dch/payment/` (Kotlin service)
+`payment-service/src/main/kotlin/pl/dch/payment/` (Kotlin service), `order-activity-service/src/main/java/pl/dch/orderactivity/`
+(consumer)
 and `marketplace-web/src/` (frontend) unless stated otherwise. Test-only paths (`concurrency/`, `lab/`) are under
 `marketplace-service/src/test/java/pl/dch/marketplace/`.
 
@@ -78,6 +79,30 @@ Test sources only (`lab/`), never part of the application. Observed timings are 
 | Downstream limits | `lab/VirtualThreadLimitsLabTest.fiftyVirtualThreads…` | 50 in flight, 5 processed (≈ 2000 ms): capacity is set by the downstream, not by the number of threads. |
 | Why virtual threads do not solve every bottleneck | `VirtualThreadLimitsLabTest` (lock, CPU), `lab/DatabasePoolLimitLabTest` (HikariCP 10) | They remove the thread-per-request cost of *waiting*; they do not add DB/HTTP connections, rate limits, lock throughput or CPU. |
 
+## Events, outbox and Kafka (Phase 4)
+
+Marketplace paths are under `marketplace-service/src/main/java/pl/dch/marketplace/`, consumer paths under
+`order-activity-service/src/main/java/pl/dch/orderactivity/`.
+
+| Topic | Where | What to talk about |
+|---|---|---|
+| Why a DB + Kafka dual write is unsafe | `checkout/OrderPlacementService.placeOrder`, `checkout/OrderPaymentUpdater.applyOutcome` (they write outbox rows, never Kafka) | Send before commit → event for a rolled-back order; send after commit → lost event on crash. No atomic commit across two systems without XA. |
+| Transactional outbox | `outbox/OutboxWriter` (`Propagation.MANDATORY`), `order/events/OrderEvents`, `db/migration/V4__transactional_outbox.sql`; test `outbox/OrderOutboxEventsIntegrationTest` (rollback, same commit, no duplicates on replay/final state) | Event row in the same transaction as the state change; JDBC joining the JPA transaction; what "same transaction" buys and what it does not. |
+| Outbox table and polling | `outbox/OutboxRepository.claimBatch`, `outbox/OutboxPublisher`, `outbox/OutboxConfiguration.OutboxPollingScheduler` | Bounded batches, partial index on unpublished rows, backoff via `next_attempt_at`, stopping a batch on failure; polling vs CDC. |
+| Concurrent publishers: `SKIP LOCKED` | `OutboxRepository.claimBatch`; tests `OutboxPublisherIntegrationTest.twoPublisherWorkersNeverClaimTheSameRow`, `aSecondWorkerCannotOvertakeTheHeadEventOfAnAggregateHeldByTheFirst` | Parallel workers without a global lock; why plain `SKIP LOCKED` breaks per-order ordering and how "head of line per aggregate" fixes it. |
+| Crash after publish, before mark | test `OutboxPublisherIntegrationTest.crashAfterSendBeforeMarkPublishesTheSameEventTwice`; consumer test `theSameEventDeliveredTwiceIsAppliedOnce` | The core lesson: outbox = at-least-once. Two records, one `eventId`; only consumer idempotency makes it harmless. |
+| Kafka unavailable | test `OutboxPublisherIntegrationTest.kafkaUnavailableLeavesRowsPendingAndALaterPollPublishesThem`; `outbox.publish_failed` log | Business commit unaffected, rows pending with attempts/error, backoff, later publication; `max.block.ms`. |
+| Kafka producer | `outbox/KafkaEventSender`, `spring.kafka.producer` in `application.yaml` | `acks=all`, idempotent producer (what it dedups and what it does not), bounded retries via `delivery.timeout.ms`, synchronous ack wait, headers. |
+| Key = orderId, ordering per partition | `KafkaEventSender` (key = aggregate id); test `publishesPendingEventsKeyedByOrderIdInOrderWithHeaders`; consumer test `eventsOfOneOrderAreAppliedInPartitionOrder` | Order only within a partition; parallelism across orders; repartitioning remaps keys; cross-topic workflows have no order. |
+| Event contract / serialization | `outbox/EventEnvelope`, `order/events/OrderEvents` (payload records); consumer `event/OrderEventParser`; tests `OutboxWriterTest`, `OrderEventParserTest` | Envelope vs payload, `schemaVersion`, additive changes, tolerant reader, no entities on the wire, no bearer session id in events, JSON numbers and `BigDecimal` scale. |
+| Idempotent consumer | `activity/ProcessedEventRepository.markProcessed` (`ON CONFLICT DO NOTHING`), `activity/OrderActivityProjector.apply` | Dedup by business event id in the same local transaction as the effect; why offsets are not enough; concurrent duplicates wait on the primary key. |
+| Consumer transaction boundary / offsets | `OrderActivityProjector.apply` (`@Transactional`), `kafka/OrderEventListener`, `spring.kafka.listener.ack-mode: record`, `enable-auto-commit: false` | DB commit first, offset commit after; the gap is covered by idempotency; no XA, no Kafka transactions. Test `transientFailureIsRetriedAndTheFailedAttemptsLeaveNoTrace`. |
+| Retry: transient vs permanent | `kafka/KafkaConsumerConfiguration` (`DefaultErrorHandler`, `ExponentialBackOffWithMaxRetries`, `addNotRetryableExceptions`), `event/PermanentEventException` | Bounded retries with backoff; never retry what cannot succeed (malformed, unsupported version, impossible transition); in-place retry blocks the partition. |
+| Dead-letter topic | `DeadLetterPublishingRecoverer` in `KafkaConsumerConfiguration`; tests `exhaustedRetries…`, `malformedEventIsDeadLetteredWithoutRetries`, `unsupportedSchemaVersionIsDeadLettered` | DLT headers (original topic/partition/offset, exception cause), no stack traces, the partition continues; what to do with DLT records. |
+| Validating state in the consumer | `OrderActivityProjector` (`ALLOWED_TRANSITIONS`, `sequence`); tests `impossibleTransitionIsDeadLettered…`, `replayedOlderEventIsIgnored` | Partition order is not a business guarantee: replays, manual messages, migrations. |
+| Eventual consistency | tests `OutboxSchedulingIntegrationTest`, `OrderActivityConsumerIntegrationTest.eventuallyBuildsTheProjectionFromOrderCreated` (Awaitility); `api/OrderActivityController` | Write completes without waiting for Kafka/consumer; the read model lags (404 = not seen yet); bounded waiting in tests instead of sleeps. |
+| Deterministic failure injection | consumer `simulation/FailureSimulator` (+ `SimulationController`, dev only); broken publishers built from real parts in `OutboxPublisherIntegrationTest` | Test hooks outside business logic; failing after the writes proves the rollback. |
+
 ## Frontend
 
 | Topic | Where | What to talk about |
@@ -103,6 +128,6 @@ Listed only to show where they will attach. Nothing below is implemented.
 | Scheduled reconciliation, expiry of never-found payments | later (see architecture.md, "Not implemented yet") |
 | Server-side retry of optimistic conflicts, conditional atomic stock update, stock reservation | not planned yet (alternatives documented in architecture.md) |
 | JMM details (happens-before, `volatile`, safe publication) beyond what the lab uses | later |
-| Kafka, transactional outbox, consumer idempotency | Phase 4 |
+| Kafka-based payment commands, sagas, CDC / Debezium, Schema Registry | not planned yet |
 | Authentication, authorization, sessions vs JWT, CORS/CSRF | Phase 5: replaces `SessionIdArgumentResolver` |
 | Heap, GC, connection pool diagnostics | Phase 6 |

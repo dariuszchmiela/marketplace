@@ -1,4 +1,4 @@
-package pl.dch.marketplace;
+package pl.dch.orderactivity;
 
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
@@ -7,10 +7,7 @@ import org.testcontainers.kafka.KafkaContainer;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import org.testcontainers.utility.DockerImageName;
 
-/**
- * Real PostgreSQL and real Kafka (KRaft, same image as docker-compose) for integration tests. Spring caches
- * the test context, so all integration test classes importing this share the same containers.
- */
+/** Real PostgreSQL and real Kafka (KRaft) — the consumer's guarantees only mean something against the real thing. */
 @TestConfiguration(proxyBeanMethods = false)
 public class TestcontainersConfiguration {
 

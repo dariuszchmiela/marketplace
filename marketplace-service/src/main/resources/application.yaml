@@ -17,6 +17,24 @@ spring:
     open-in-view: false
   flyway:
     enabled: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      # Keys (order id) and values (JSON already built by the outbox) are plain strings.
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      # Reliable delivery: the leader and all in-sync replicas must have the record before it counts as sent.
+      acks: all
+      properties:
+        # Idempotent producer: broker-side dedup of the producer's own internal retries (no duplicates, no
+        # reordering within a partition). It does NOT dedup our outbox re-sends: those carry the same eventId
+        # and are deduplicated by the consumer.
+        enable.idempotence: true
+        # Retries are left at the default (effectively unlimited) and bounded by time instead:
+        delivery.timeout.ms: 10000
+        request.timeout.ms: 5000
+        # How long send() may block waiting for metadata when the broker is unreachable.
+        max.block.ms: 5000
 
 springdoc:
   swagger-ui:
@@ -46,3 +64,22 @@ payment:
       # decide whether it closes again or reopens.
       wait-duration-in-open-state: 15s
       permitted-calls-in-half-open-state: 2
+
+outbox:
+  topics:
+    # One topic for all order events, keyed by order id (ordering per order, parallelism across orders).
+    Order: ${ORDER_EVENTS_TOPIC:marketplace.order-events}
+  topic-partitions: 3
+  publisher:
+    enabled: ${OUTBOX_PUBLISHER_ENABLED:true}
+    poll-interval: 500ms
+    batch-size: 50
+    # Must be >= producer delivery.timeout.ms so that a send is not abandoned while the producer still retries.
+    send-timeout: 12s
+    initial-retry-backoff: 1s
+    max-retry-backoff: 60s
+
+logging:
+  level:
+    # The Kafka clients log their complete configuration at INFO on every start.
+    org.apache.kafka: WARN

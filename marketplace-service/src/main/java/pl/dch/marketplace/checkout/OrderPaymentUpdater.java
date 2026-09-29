@@ -17,6 +17,7 @@ import pl.dch.marketplace.order.OrderLine;
 import pl.dch.marketplace.order.OrderRepository;
 import pl.dch.marketplace.order.OrderResponse;
 import pl.dch.marketplace.order.OrderStatus;
+import pl.dch.marketplace.order.events.OrderEvents;
 import pl.dch.marketplace.payment.PaymentOutcome;
 import pl.dch.marketplace.product.ProductRepository;
 import pl.dch.marketplace.session.SessionId;
@@ -39,13 +40,16 @@ public class OrderPaymentUpdater {
     private final OrderRepository orderRepository;
     private final ProductRepository productRepository;
     private final CartRepository cartRepository;
+    private final OrderEvents orderEvents;
 
     public OrderPaymentUpdater(OrderRepository orderRepository,
                                ProductRepository productRepository,
-                               CartRepository cartRepository) {
+                               CartRepository cartRepository,
+                               OrderEvents orderEvents) {
         this.orderRepository = orderRepository;
         this.productRepository = productRepository;
         this.cartRepository = cartRepository;
+        this.orderEvents = orderEvents;
     }
 
     /**
@@ -63,19 +67,27 @@ public class OrderPaymentUpdater {
 
         OrderStatus before = order.getStatus();
         switch (outcome) {
-            case PaymentOutcome.Succeeded succeeded -> order.markPaid(succeeded.paymentId());
+            // Every real transition writes exactly one outbox event in this transaction. An outcome for a final
+            // order returned above (replay, late reconciliation) writes nothing.
+            case PaymentOutcome.Succeeded succeeded -> {
+                order.markPaid(succeeded.paymentId());
+                orderEvents.orderPaid(order);
+            }
             case PaymentOutcome.Declined declined -> {
                 order.markPaymentDeclined(declined.paymentId());
                 returnItems(order);
+                orderEvents.orderPaymentFailed(order);
             }
             case PaymentOutcome.NotProcessed ignored -> {
                 order.markPaymentNotProcessed();
                 returnItems(order);
+                orderEvents.orderPaymentFailed(order);
             }
             case PaymentOutcome.Unknown ignored -> {
-                // Already UNKNOWN (e.g. reconciliation did not find a payment): nothing new is known.
+                // Already UNKNOWN (e.g. reconciliation did not find a payment): nothing new is known, no event.
                 if (order.getStatus() == OrderStatus.PAYMENT_PENDING) {
                     order.markPaymentUnknown();
+                    orderEvents.orderPaymentUnknown(order);
                 }
             }
         }

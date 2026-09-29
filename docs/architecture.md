@@ -1,4 +1,4 @@
-# Architecture (Phase 3)
+# Architecture (Phase 4)
 
 ## Overview
 
@@ -10,10 +10,18 @@ Browser (React, Vite dev server :5173)
 Vite proxy ──► marketplace-service (Java, Spring Boot, :8080) ──HTTP──► payment-service (Kotlin, Spring Boot, :8081)
                   │  Spring Data JPA / Hibernate                           in-memory payments (Phase 2 simplification)
                   ▼
-               PostgreSQL (schema owned by Flyway)
+               PostgreSQL public schema (orders, …, outbox_event)
+                  │  outbox publisher (polling)
+                  ▼
+               Kafka  marketplace.order-events (3 partitions, key = orderId)
+                  │
+                  ▼
+               order-activity-service (Java, :8082) ──► PostgreSQL schema order_activity
+                  └─ failures after retries ──► Kafka marketplace.order-events.DLT
 ```
 
-Two backend services and one frontend. No messaging, no authentication yet.
+Three backend services and one frontend. The frontend uses only the synchronous marketplace API; the event path is
+downstream of it and never on a user request path. No authentication yet.
 
 ## Backend: `marketplace-service`
 
@@ -27,8 +35,9 @@ Bean Validation, Flyway, springdoc-openapi, Resilience4j 2.4 (core modules only)
 | `product` | `Product` entity (with `@Version`), read-only catalog API, atomic stock return |
 | `cart` | `Cart` aggregate (`Cart` + `CartItem`), cart API, early stock feedback |
 | `checkout` | checkout orchestration, the two checkout transactions, payment reconciliation |
-| `order` | `Order` (payment state machine) + immutable `OrderLine`, read API scoped to the session |
+| `order` | `Order` (payment state machine) + immutable `OrderLine`, read API scoped to the session; `order.events`: order integration events written to the outbox |
 | `payment` | HTTP client for payment-service: timeouts, retry, circuit breaker, outcome classification |
+| `outbox` | transactional outbox: `OutboxWriter` (same transaction), `OutboxRepository` (JDBC, SKIP LOCKED claim), `OutboxPublisher` (polling), `KafkaEventSender` |
 | `session` | `SessionId` value + argument resolver reading `X-Session-Id` |
 | `common` | `ErrorCode`, `MarketplaceException`, `ApiError`, `GlobalExceptionHandler` |
 
@@ -359,6 +368,180 @@ Virtual threads make *waiting* cheap (10 000 sleeping virtual threads finish in 
 database connections, HTTP connections, downstream capacity, rate limits, lock throughput or CPU cores. The production
 checkout does not use them: its three steps are dependent, not independent, so there is nothing to parallelize.
 
+## Events, transactional outbox and Kafka (Phase 4)
+
+### Why not "save the order, then send to Kafka"?
+
+A dual write to two systems cannot be atomic. Send inside the DB transaction → the transaction can still roll back
+after Kafka accepted the message (event for an order that does not exist). Send after the commit → the process can die
+between commit and send (order without event, lost forever). Either way DB and Kafka silently disagree.
+
+**Transactional outbox:** the event is written as a row of the *same* database, in the *same* transaction as the
+business change. Both commit or both roll back. A separate publisher later copies committed rows to Kafka.
+
+```text
+Order transaction (checkout tx 1 / payment tx 2)
+    |
+    +-- orders                       ┐ one COMMIT
+    +-- outbox_event (pending)       ┘
+          |
+          v
+     outbox publisher  (poll every 500 ms: claim batch FOR UPDATE SKIP LOCKED → send → mark published)
+          |
+          v
+     Kafka marketplace.order-events  (key = orderId, headers eventId/eventType/schemaVersion)
+          |
+          v
+     order-activity-service listener
+          |
+          +-- processed_event (eventId)  ┐ one local COMMIT, then the offset is committed
+          +-- order_activity (+ entry)   ┘
+          |
+          +-- transient failure → retried 3× with backoff; permanent or exhausted → marketplace.order-events.DLT
+```
+
+### Event model
+
+| Event | Written when (same transaction) | Payload (plus envelope) |
+|---|---|---|
+| `OrderCreated` | tx 1 creates the order (`OrderPlacementService`) | orderId, status `PAYMENT_PENDING`, total, currency, createdAt, lines |
+| `OrderPaid` | transition to `PAID` (`OrderPaymentUpdater`) | orderId, status, total, currency, paymentId |
+| `OrderPaymentFailed` | transition to `PAYMENT_FAILED` | orderId, status, total, currency, reason (`DECLINED`/`NOT_PROCESSED`), paymentId |
+| `OrderPaymentUnknown` | transition to `PAYMENT_UNKNOWN` | orderId, status, total, currency |
+
+`OrderPaymentUnknown` is included because it is a real, visible state ("payment being verified") that downstream
+views should show; it is later followed by `OrderPaid` or `OrderPaymentFailed`.
+
+Envelope (JSON, `outbox/EventEnvelope`): `eventId` (UUID), `eventType`, `schemaVersion` (1), `aggregateType` (`Order`),
+`aggregateId`, `sequence` (1, 2, 3 per order), `occurredAt`, `payload`. Payloads are explicit records
+(`order/events/OrderEvents`), never JPA entities, and self-contained. The anonymous session id is **not** included (it is a
+bearer credential for the cart and orders). `Order` itself knows nothing about events or Kafka.
+
+No event is written when nothing changed: a replayed checkout key, an outcome for an already final order (late checkout
+thread, repeated reconciliation) and an "unknown → still unknown" reconciliation write no outbox row (tested).
+
+**Serialization and compatibility.** JSON built once by the outbox writer and sent unchanged (`StringSerializer`); no
+Schema Registry. Within a schema version changes are additive only; consumers ignore unknown fields (tolerant reader).
+Removing/renaming/retyping a field requires a new `schemaVersion`, which consumers must support explicitly — unsupported
+versions are rejected to the DLT, never guessed. The consumer has its own copy of the contract (no shared jar).
+
+### Outbox table (`V4__transactional_outbox.sql`)
+
+`id`, `event_id` (unique), `aggregate_type`, `aggregate_id`, `event_type`, `schema_version`, `sequence`
+(unique per aggregate), `payload` (`JSON`: the exact message), `occurred_at`, `published_at` (NULL = pending),
+`attempt_count`, `last_attempt_at`, `next_attempt_at` (backoff), `last_error`. A partial index covers only unpublished
+rows, so polling stays cheap however large the table grows. Written with JDBC (`outbox/OutboxRepository`), which joins the
+current JPA transaction; `OutboxWriter.append` is `Propagation.MANDATORY` — writing an event outside a transaction fails.
+
+### Publication algorithm (`outbox/OutboxPublisher`)
+
+```sql
+-- one short transaction per batch (batch-size 50)
+select … from outbox_event o
+where o.published_at is null
+  and (o.next_attempt_at is null or o.next_attempt_at <= clock_timestamp())
+  and not exists (select 1 from outbox_event e            -- head of line per order
+                  where e.aggregate_type = o.aggregate_type and e.aggregate_id = o.aggregate_id
+                    and e.published_at is null and e.id < o.id)
+order by o.id limit 50
+for update of o skip locked;
+-- for each row: send to Kafka and wait for the ack → mark published
+-- on a send failure: attempt_count+1, last_error, next_attempt_at = now + backoff (1 s … 60 s); stop the batch
+commit
+```
+
+- **Several publisher instances**: `FOR UPDATE SKIP LOCKED` — a row claimed by one instance is skipped (not waited for)
+  by the others, so they work in parallel on different rows and never publish the same row at the same time
+  (test `twoPublisherWorkersNeverClaimTheSameRow`). Nothing is globally serialized.
+- **Ordering per order**: only the oldest unpublished event of an order is eligible. Without that, instance B could
+  publish `OrderPaid` while instance A still holds `OrderCreated` of the same order (test
+  `aSecondWorkerCannotOvertakeTheHeadEventOfAnAggregateHeldByTheFirst`). A failing event blocks only its own order.
+- **Kafka down**: the send fails after `max.block.ms`; the row stays pending with the error and a backoff; the business
+  transaction was committed long before and is unaffected; a later poll publishes it (test + smoke test).
+- **The claim is held during the send.** This background job keeps its short transaction (and one connection) open while
+  waiting for the broker, bounded by batch size and producer timeouts; it is never on a user request path. (A lease
+  column instead of row locks would avoid that, at the cost of more moving parts.)
+- **Crash window**: Kafka acknowledged the record, then the process dies (or the UPDATE fails) before `published_at` is
+  committed → the claim rolls back → the row is sent **again** later. Test `crashAfterSendBeforeMarkPublishesTheSameEventTwice`
+  shows two Kafka records with the same `eventId`. The outbox guarantees *never lost*, not *exactly once*.
+- Scheduling is a separate bean (`outbox.publisher.enabled`); poll interval, batch size, send timeout and backoff are
+  configurable (`outbox.*`).
+
+### Topic, key and ordering
+
+One topic `marketplace.order-events` (3 partitions; name configurable) for all order events — consumers usually need
+the whole lifecycle of an order in order. Key = `orderId` → all events of an order land in the same partition, and Kafka
+keeps order **within a partition**. There is no global order: different orders are on different partitions and are
+processed in parallel (one listener thread per partition). The idempotent producer (`enable.idempotence`,
+`acks=all`) keeps the producer's own internal retries from duplicating or reordering records within a partition.
+
+Partition ordering does not protect against: a manually produced or replayed message, a future topic migration or
+repartitioning (changing the partition count remaps keys), or workflows spanning several topics. So the consumer does not
+trust order blindly: it checks `sequence` (older → ignored as stale) and validates state transitions (impossible →
+DLT).
+
+### Producer configuration (marketplace `application.yaml`)
+
+`acks=all` (all in-sync replicas), `enable.idempotence=true`, retries left at the default and bounded by
+`delivery.timeout.ms=10000`, `request.timeout.ms=5000`, `max.block.ms=5000`, String key/value serializers. The
+publisher waits synchronously for each ack (`send-timeout` 12 s ≥ delivery timeout).
+
+### Consumer: `order-activity-service`
+
+A small separate Spring Boot service (Java 25, spring-kafka, JDBC, Flyway) that builds an "order activity" view:
+`order_activity` (current status, total, last event id and sequence) and `order_activity_entry` (history like "Payment
+confirmed"). Own schema `order_activity` in the same PostgreSQL server locally (own tables, own Flyway history; it never
+reads the marketplace tables) — a separate database in production.
+
+**Transaction boundary and idempotency** (`activity/OrderActivityProjector.apply`, one `@Transactional` method):
+
+```text
+INSERT INTO processed_event(event_id) ON CONFLICT DO NOTHING   -- 0 rows → duplicate → return, nothing else happens
+SELECT order_activity … FOR UPDATE
+sequence <= last_sequence → stale, ignore
+transition not allowed    → InvalidStateTransitionException (permanent)
+INSERT/UPDATE order_activity, INSERT order_activity_entry
+COMMIT
+```
+
+The listener returns only after that commit; with `ack-mode: record` and auto-commit off, the container then commits the
+offset. A crash between DB commit and offset commit redelivers the record → found in `processed_event` → skipped. If
+anything fails before the commit, everything rolls back including the `processed_event` row, and Kafka redelivers
+(test `transientFailureIsRetriedAndTheFailedAttemptsLeaveNoTrace`). Kafka offsets alone cannot provide business
+idempotency: the outbox itself may publish an event twice. No XA, no Kafka transactions.
+
+**Retry and DLT** (`kafka/KafkaConsumerConfiguration`): `DefaultErrorHandler` with `ExponentialBackOffWithMaxRetries(3)`
+(200 ms, 400 ms, 800 ms) for transient failures (any exception except `PermanentEventException`: e.g. a DB hiccup,
+`SimulatedTransientFailure`). Permanent failures — malformed JSON, missing/invalid required field, unsupported
+`schemaVersion`/type, impossible transition — are not retried. After that the `DeadLetterPublishingRecoverer` publishes
+the original record to `marketplace.order-events.DLT` (same partition) with headers `kafka_dlt-original-topic/-partition/
+-offset/-timestamp`, `kafka_dlt-exception-cause-fqcn`, `…-exception-message` (the stack-trace header is dropped); the
+offset is committed and the partition continues with the next record (test
+`exhaustedRetriesGoToTheDeadLetterTopicAndLaterRecordsAreStillProcessed`). Retries happen in place, so the partition
+waits during backoff: order per order is kept, at the cost of head-of-line blocking of that partition for ~1.4 s.
+
+**Failure simulation** (dev/test only): `simulation/FailureSimulator` fails the next N attempts of events matching an
+order id or event type, *after* all writes and before the commit (proves rollback). Exposed over HTTP only with
+`order-activity.simulation.enabled=true` (`SimulationController`).
+
+### Eventual consistency
+
+```text
+checkout HTTP response   ← marketplace DB committed (order + outbox rows pending)
+~0–500 ms later          ← outbox publisher sends, marks published
+milliseconds later       ← consumer commits processed_event + projection, then the offset
+```
+
+The order write never waits for Kafka or the consumer; `GET /api/order-activity/{id}` may briefly show an older status
+or 404. If Kafka is down, the lag grows until it is back; nothing is lost. The frontend does not use the projection.
+
+### Logging
+
+`outbox.created`, `outbox.publish_attempt`, `outbox.sent` (topic/partition/offset), `outbox.published`,
+`outbox.publish_failed`, `outbox.poll_failed`; `event.received` (topic/partition/offset/attempt), `event.duplicate`,
+`event.stale`, `event.processed`, `event.retry`, `event.failed permanent=true`, `event.dead_lettered` — all with eventId,
+eventType and order id, no payload bodies.
+
 ## Frontend: `marketplace-web`
 
 React 19 + TypeScript + Vite, plain CSS, no UI framework, no router, no global state library.
@@ -382,7 +565,16 @@ Backend `marketplace-service` (`mvn test`): unit tests (Mockito, domain), `Payme
 integration tests with Testcontainers PostgreSQL + MockMvc + `FakePaymentServer` (`PaymentCheckoutIntegrationTest`:
 paid, declined, retries, not processed, unknown → reconciliation, replay, concurrent duplicates, transaction boundary,
 open circuit), Phase 3 race tests in `concurrency/` (last unit, stock paths, cart, order outcome vs reconciliation,
-lock scope), `common/ConcurrencyErrorMappingTest`, and the training lab in `lab/`.
+lock scope), `common/ConcurrencyErrorMappingTest`, the training lab in `lab/`, and Phase 4 outbox tests in `outbox/`
+(`OrderOutboxEventsIntegrationTest`: which events each transaction writes, rollback, no duplicates;
+`OutboxPublisherIntegrationTest`: real Kafka — keyed/ordered publication, Kafka unavailable, crash window, concurrent
+workers, head of line; `OutboxSchedulingIntegrationTest`: the scheduled publisher; `OutboxWriterTest`: serialization).
+All integration tests share one PostgreSQL and one Kafka container (Testcontainers, `apache/kafka:4.1.1`).
+
+order-activity-service (`mvn test`): `OrderEventParserTest` (contract, tolerant reader, malformed/unsupported),
+`OrderActivityConsumerIntegrationTest` (real Kafka + PostgreSQL: eventual projection, ordering, duplicate delivery,
+transient retry with rollback, exhausted retries → DLT and continue, malformed/unsupported/impossible transition → DLT,
+stale replay ignored).
 
 payment-service (`mvn test`): `PaymentServiceTest` (idempotency incl. 32 concurrent threads), `ScenarioSimulatorTest`,
 `PaymentApiIntegrationTest` (real HTTP on a random port: every scenario, 16 concurrent HTTP requests with one key).
@@ -398,7 +590,11 @@ rendering of paid/declined/technical failure/unknown, reconciliation button, rel
   the payment with the same key, or voiding it after a grace period) needs a provider-side contract and is deferred.
 - **Durable payment storage:** payment-service is in memory; a restart forgets payments (and reconciliation would then
   find nothing).
-- **Events:** no Kafka, no outbox (Phase 4). The payment call is synchronous inside the checkout request.
+- **Asynchronous payment:** the payment call is still synchronous HTTP inside the checkout request; Kafka carries only
+  downstream notifications of state changes. No saga, no Kafka-based payment commands, no CDC/Debezium, no Schema Registry.
+- **Outbox housekeeping:** published outbox rows are kept forever (no retention job); a row that never publishes is
+  retried with capped backoff forever (visible in `last_error`, no alerting). Processed-event ids are kept forever too.
+- **DLT handling:** records in `marketplace.order-events.DLT` are only stored; no replay tool or alerting.
 - **Stock reservation / server-side retry of optimistic conflicts:** a conflicting buyer gets 409 and must retry, even
   when enough units were left (false conflict on a hot product). See Concurrency for the alternatives.
 - **Security:** no users, authentication or service-to-service auth; `X-Session-Id` is a bearer identifier only.

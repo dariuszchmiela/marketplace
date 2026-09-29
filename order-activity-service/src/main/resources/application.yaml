@@ -1,0 +1,55 @@
+spring:
+  application:
+    name: order-activity-service
+  datasource:
+    # Same PostgreSQL server as the marketplace locally, but its own schema, own tables and own Flyway history.
+    # In production this would be a separate database: the consumer never reads the marketplace's tables.
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/marketplace}
+    username: ${DB_USERNAME:marketplace}
+    password: ${DB_PASSWORD:marketplace}
+    hikari:
+      schema: order_activity
+  flyway:
+    schemas: order_activity
+    default-schema: order_activity
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: order-activity-service
+      # A new consumer group starts at the beginning of the topic and builds the projection from all events.
+      auto-offset-reset: earliest
+      # Offsets are committed by the listener container after the local transaction committed (ack-mode below).
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      # Used only to publish failed records to the dead-letter topic.
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+    listener:
+      # Commit the offset of each record right after the listener returned successfully (= after our DB commit).
+      ack-mode: record
+      # One consumer thread per partition of the order-events topic.
+      concurrency: 3
+
+server:
+  port: ${PORT:8082}
+
+order-activity:
+  topics:
+    order-events: ${ORDER_EVENTS_TOPIC:marketplace.order-events}
+    dead-letter: ${ORDER_EVENTS_DLT:marketplace.order-events.DLT}
+    partitions: 3
+  retry:
+    # Transient failures: 1 delivery + 3 retries with 200 ms, 400 ms, 800 ms backoff, then the dead-letter topic.
+    max-retries: 3
+    initial-interval: 200ms
+    multiplier: 2.0
+  simulation:
+    # Dev/test only: enables POST /api/simulation/failures to make the next matching events fail.
+    enabled: ${ORDER_ACTIVITY_SIMULATION_ENABLED:false}
+
+logging:
+  level:
+    org.apache.kafka: WARN
