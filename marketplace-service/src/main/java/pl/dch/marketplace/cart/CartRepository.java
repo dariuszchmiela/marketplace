@@ -4,7 +4,6 @@ import java.util.Optional;
 import java.util.UUID;
 
 import jakarta.persistence.LockModeType;
-import org.springframework.data.jpa.repository.EntityGraph;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
@@ -23,8 +22,14 @@ import org.springframework.data.repository.query.Param;
  */
 public interface CartRepository extends JpaRepository<Cart, Long> {
 
-    @EntityGraph(attributePaths = "items")
-    Optional<Cart> findBySessionId(UUID sessionId);
+    /**
+     * Cart and its items in one query (left join: an empty cart is still found; distinct: one Cart per row set).
+     * An explicit fetch join instead of {@code @EntityGraph(attributePaths = "items")}: the ad-hoc entity graph made
+     * Spring Data first look up a <em>named</em> graph "Cart.findBySessionId" on every call, which Hibernate answers
+     * with an internally thrown and caught IllegalArgumentException (found with JFR, see production-diagnostics.md).
+     */
+    @Query("select distinct c from Cart c left join fetch c.items i where c.sessionId = :sessionId order by i.id")
+    Optional<Cart> findBySessionId(@Param("sessionId") UUID sessionId);
 
     /**
      * No fetch join: PostgreSQL cannot {@code FOR UPDATE} the nullable side of an outer join.

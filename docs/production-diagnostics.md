@@ -328,7 +328,10 @@ CPULoad 9 events. Two findings came straight out of it:
      reflective proxy wraps it (`InvocationTargetException`). Spring catches it and falls back to the ad-hoc graph.
    - The cost: about two stack traces per cart/order lookup, invisible in the logs and visible only in JFR. It is
      functionally harmless.
-   - The fix (not applied in this phase): a `@NamedEntityGraph` with that name on the entity, or a `JOIN FETCH` query.
+   - **Fixed after Phase 6.** The four hot reads now use explicit JPQL fetch joins
+     (`select distinct … left join fetch …`). Verified with the same kind of JFR run: "No EntityGraph with given
+     name" went from 1,205 to **0** (`IllegalArgumentException` 1,209 → 4) for the same workload. See
+     `FetchJoinReadsIntegrationTest` for the one-query and ownership checks.
 
 Thread dump of the live marketplace: 66 threads (RUNNABLE 13, TIMED_WAITING 19, WAITING 13). They included
 http-nio 12, HikariPool housekeeper 1, kafka-producer 1, scheduling 1, and OTel exporter 3.
