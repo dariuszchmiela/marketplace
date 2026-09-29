@@ -34,9 +34,21 @@ public class Product {
     private int availableQuantity;
 
     /**
-     * Optimistic locking version. Hibernate increments it on every update and adds
-     * {@code WHERE version = ?} to the UPDATE statement. Concurrency handling around it
-     * is deliberately left for the concurrency lab phase.
+     * Optimistic locking version: Hibernate increments it on every update and adds
+     * {@code WHERE version = ?} to the UPDATE. If another transaction changed the row since we read it,
+     * the UPDATE matches 0 rows and the transaction fails instead of overwriting that change (no lost update).
+     * <p>
+     * Stock strategy:
+     * <ul>
+     *   <li><b>purchase</b> ({@link #decreaseStock}, checkout transaction 1): read–check–write through this
+     *       entity, protected by this version. Two buyers of the last unit both read stock 1; the second
+     *       commit fails and checkout answers 409 {@code CONCURRENT_STOCK_CHANGE}. Stock can never go negative
+     *       (domain check here + {@code CHECK (available_quantity >= 0)} in the database).</li>
+     *   <li><b>compensation</b> ({@code ProductRepository.increaseStock}, failed payment): a single atomic
+     *       {@code UPDATE … + ?} that also bumps this version. It needs no read, so it cannot lose updates and
+     *       never has to fail; bumping the version makes a checkout that read the old stock fail instead of
+     *       silently overwriting the returned units.</li>
+     * </ul>
      */
     @Version
     @Column(nullable = false)

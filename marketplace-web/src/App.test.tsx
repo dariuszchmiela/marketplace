@@ -89,6 +89,27 @@ describe('App checkout', () => {
     expect(second).not.toBe(first)
   })
 
+  it('after a concurrent stock change shows the message, reloads cart and catalog, and retries as a new attempt', async () => {
+    vi.spyOn(api, 'checkout')
+      .mockRejectedValueOnce(
+        new ApiError(409, 'CONCURRENT_STOCK_CHANGE', 'Another purchase changed the stock of a product in your cart at the same time.'),
+      )
+      .mockResolvedValueOnce(paidOrder)
+    const button = await renderApp()
+    const loadsBefore = { cart: vi.mocked(api.getCart).mock.calls.length, products: vi.mocked(api.getProducts).mock.calls.length }
+
+    await act(async () => fireEvent.click(button))
+
+    expect(screen.getByRole('alert').textContent).toContain('Another purchase changed the stock')
+    expect(vi.mocked(api.getCart).mock.calls.length).toBe(loadsBefore.cart + 1)
+    expect(vi.mocked(api.getProducts).mock.calls.length).toBe(loadsBefore.products + 1)
+
+    await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Checkout' })))
+    const [first, retry] = checkoutKeys()
+    // 409 is a definitive rejection (nothing was ordered), so the retry is a new attempt.
+    expect(retry).not.toBe(first)
+  })
+
   it('sends one checkout request for a double click', async () => {
     let finish: () => void = () => {}
     const checkout = vi

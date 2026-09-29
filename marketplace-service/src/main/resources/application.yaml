@@ -6,6 +6,10 @@ spring:
     username: ${DB_USERNAME:marketplace}
     password: ${DB_PASSWORD:marketplace}
   jpa:
+    properties:
+      # UPDATEs in a flush are sorted by entity and id, so two checkouts buying the same products
+      # lock the product rows in the same (ascending id) order and cannot deadlock each other.
+      hibernate.order_updates: true
     # Schema is owned by Flyway; Hibernate only checks that entities match it.
     hibernate:
       ddl-auto: validate

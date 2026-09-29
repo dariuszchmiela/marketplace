@@ -1,4 +1,4 @@
-# Architecture (Phase 2)
+# Architecture (Phase 3)
 
 ## Overview
 
@@ -77,7 +77,8 @@ Every error, including Spring MVC's own, has the same body:
 
 Business code throws `MarketplaceException(ErrorCode, message)`; the HTTP status is chosen in one
 place (`GlobalExceptionHandler.statusFor`). Validation/header problems → 400 (incl. `MISSING_IDEMPOTENCY_KEY`,
-`INVALID_IDEMPOTENCY_KEY`), not found → 404, stock conflicts and `PAYMENT_RECONCILIATION_CONFLICT` → 409,
+`INVALID_IDEMPOTENCY_KEY`), not found → 404, stock conflicts, concurrency conflicts (`CONCURRENT_STOCK_CHANGE`,
+`CONCURRENT_MODIFICATION`) and `PAYMENT_RECONCILIATION_CONFLICT` → 409,
 empty cart → 422, `PAYMENT_SERVICE_UNAVAILABLE` (reconciliation could not reach payment-service) → 503,
 anything unexpected → 500. payment-service uses the same body shape.
 
@@ -188,11 +189,11 @@ reconciliation cannot overwrite each other (the row lock serializes them).
   `UNIQUE (session_id, checkout_idempotency_key)` (migration `V3__payment_integration.sql`).
 - **Sequential replay:** transaction 1 finds the order by key and returns it (200) in its current state;
   payment-service is not called again, and the (possibly refilled) cart is not touched.
-- **Concurrent duplicates:** both requests may miss each other's order at first. The loser then fails
-  either on the unique constraint (its INSERT waits for the winner's commit), on the product version, or,
-  if the winner committed between its key lookup and its cart read, with `CART_EMPTY`/`INSUFFICIENT_STOCK`.
-  `CheckoutService` handles all of these the same way: if an order exists for the key, it is returned;
-  otherwise the original failure is rethrown. (The `CART_EMPTY` race was found by the smoke test.)
+- **Concurrent duplicates:** since Phase 3 transaction 1 locks the session's cart row first, so a duplicate waits
+  for the first request to commit and then finds its order by key (replay). As a safety net `CheckoutService` still
+  returns the order for the key whenever placement fails for any reason (unique constraint, version, `CART_EMPTY`)
+  and an order for that key exists; otherwise the failure is rethrown or translated (see Concurrency).
+  (The `CART_EMPTY` race of Phase 2 was found by the smoke test.)
 - The order also gets its own **payment idempotency key** (`orders.payment_idempotency_key`, unique), generated
   once and used for every payment attempt and for reconciliation. Retries can never create a second payment.
 
@@ -271,7 +272,92 @@ Reconciliation is explicit (endpoint + button), not scheduled: the simplest conc
   Hibernate runs with `ddl-auto: validate`; `open-in-view` is disabled.
 - No foreign keys from `cart_item`/`order_line` to `product` on purpose (cart is not the source of truth;
   order lines are snapshots).
-- `Product.version` (`@Version`) protects stock decreases in checkout; conflicts are not yet translated (Phase 3).
+- `Product.version` (`@Version`) protects stock decreases in checkout; conflicts are translated to 409 (see Concurrency).
+- `hibernate.order_updates: true`: UPDATEs of one flush are sorted by entity and id (consistent lock order).
+
+## Concurrency (Phase 3) — production behaviour
+
+Principle: **optimistic locking where a conflict is a real business event** (two shoppers, one product),
+**short pessimistic row locks where the resource belongs to one owner and failing would be worse than waiting**
+(one shopper's cart, one order's payment result), atomic SQL where a write must never fail (stock return).
+Nothing is globally serialized, and no lock is ever held during a remote call.
+
+| Resource | Strategy | Code | What a race produces |
+|---|---|---|---|
+| Product stock (purchase) | optimistic: entity + `@Version` | `Product.decreaseStock`, `OrderPlacementService` (tx 1) | loser's commit matches 0 rows → 409 `CONCURRENT_STOCK_CHANGE`, loser's transaction fully rolled back |
+| Product stock (compensation) | atomic `UPDATE … + ?, version = version + 1` | `ProductRepository.increaseStock` | never fails; bumps the version so a purchase that read the old stock fails instead of overwriting it |
+| Cart | pessimistic: `SELECT … FOR UPDATE` on the cart row for every mutation; `INSERT … ON CONFLICT DO NOTHING` to create | `CartRepository.findBySessionIdForUpdate` / `lockOrCreate`, `CartService`, `OrderPlacementService`, `OrderPaymentUpdater` | mutations of one cart run one after another: no lost update, no duplicate line, no unique-key 500 |
+| Order payment result | pessimistic: `SELECT … FOR UPDATE` on the order row + final-state check | `OrderRepository.findByIdForUpdate`, `OrderPaymentUpdater.applyOutcome` | first outcome wins; later ones are ignored (`order.payment_outcome_ignored`), compensation runs at most once |
+
+### Two shoppers, one last unit
+
+```text
+stock = 1, version = 7
+tx A: SELECT product → stock 1, v7          tx B: SELECT product → stock 1, v7
+tx A: UPDATE … stock=0, v=8 WHERE v=7 ✔     tx B: UPDATE … WHERE v=7  (waits for A's row lock)
+tx A: COMMIT                                 tx B: re-checks → 0 rows → StaleObjectStateException → ROLLBACK
+                                             → CheckoutService: 409 CONCURRENT_STOCK_CHANGE
+```
+
+- Exactly one order and one payment exist for the last unit; stock can never go negative (domain check +
+  `CHECK (available_quantity >= 0)`); the loser's order insert, stock change and cart clearing are all rolled back.
+- `CheckoutService.translate` maps the optimistic failure (transaction 1 only updates `Product`) to
+  `CONCURRENT_STOCK_CHANGE` with a "review your cart and try again" message — no JPA/SQL details.
+- `GlobalExceptionHandler` maps any other `ConcurrencyFailureException` (optimistic conflict, lock timeout, deadlock
+  victim) to 409 `CONCURRENT_MODIFICATION` as a centralized safety net. Unexpected bugs stay 500.
+- **Trade-off (measured):** optimistic locking conflicts on the *row*, not on the *quantity*. 10 shoppers racing for
+  3 units: in our runs typically only 1 bought and 9 got 409 although units were left — correct, never oversold, but
+  unfriendly for a hot product. Alternatives, not implemented: retry transaction 1 a few times on conflict (safe: it
+  has no side effects outside the DB), or a conditional atomic `UPDATE … SET stock = stock - ? WHERE stock >= ?`
+  (no false conflicts, but the stock check moves into SQL).
+
+### Cart
+
+Before Phase 3, 10 concurrent "+1" requests for the same line ended at quantity **2 instead of 11** (lost updates) and
+concurrent first adds of a new session failed with 500 (unique `cart.session_id`). Now every mutation locks the cart
+row first. A cart belongs to one shopper, so contention is tiny and waiting a few milliseconds is better than a
+conflict error — in particular for the payment-failure restore, which cannot ask anyone to "try again".
+The restore is idempotent through the order's final state (it runs only in the transaction that moves the order to
+`PAYMENT_FAILED`, under the order row lock). Checkouts of the same session are also serialized by this lock.
+
+### Lock order and lock scope
+
+- Global lock order: **order row → cart row → product rows (ascending id)**. Transaction 1 locks cart, then updates
+  products at commit (`hibernate.order_updates` sorts them by id); transaction 2 locks order, then cart, then returns
+  stock in ascending product id; cart edits lock only the cart. No transaction takes these locks in the opposite
+  order, so they cannot deadlock each other.
+- All locks live inside the short transactions 1 and 2 and cart mutations. The payment call and the reconciliation
+  lookup run with **no transaction, no DB connection and no row lock** — enforced by `PaymentClient.requireNoTransaction`
+  and verified by `OrderPaymentRaceIntegrationTest.noRowLockOrTransactionIsHeldWhilePaymentServiceIsCalled`
+  (`SELECT … FOR UPDATE NOWAIT` on order, cart and product rows succeeds while payment-service is handling the call).
+
+### How the races are tested (deterministically)
+
+`concurrency/RowLockHolder` holds a row lock in its own JDBC transaction. Application transactions can still *read*
+the row (PostgreSQL MVCC) but queue as soon as they write/lock it; the test waits until `pg_stat_activity` shows the
+expected number of lock waiters, then releases the lock. So both checkouts really have read "stock = 1" before either
+writes — without any sleeps or hooks in production code. Tests: `LastItemCheckoutConcurrencyIntegrationTest`,
+`StockUpdateConcurrencyIntegrationTest`, `CartConcurrencyIntegrationTest`, `OrderPaymentRaceIntegrationTest`.
+
+## Concurrency lab (training only, `src/test/.../lab`)
+
+Not part of the application: test sources only, no endpoints, no application executor changed. A deterministic fake
+downstream (`lab/FakeDownstream`, fixed latency, optional concurrency limit) and a blocking HTTP client
+(`lab/DownstreamClient`). Observed values are printed as `[LAB] …` lines when the tests run.
+
+| Experiment | Code | Shows |
+|---|---|---|
+| 3 independent 300 ms calls: sequential / `CompletableFuture` / virtual threads | `ProductPageLoader`, `ParallelCallsLabTest` | ≈ 900 ms vs ≈ 300 ms vs ≈ 300 ms: concurrency cuts wall-clock time for independent blocking I/O; virtual threads are not faster than `CompletableFuture` on a pool, and neither is faster than the slowest remote call |
+| explicit executor | `ProductPageLoader.newIoExecutor` | named platform pool `product-page-io-*`, never the implicit `ForkJoinPool.commonPool()` |
+| failure / timeout | `ParallelCallsLabTest` | CF variant is **fail-fast** (fails in a few ms when one call fails; `allOf` alone would wait for the slowest; `cancel` does not interrupt the blocked thread); VT variant is **structured** (fails only after its siblings finished); `orTimeout` stops waiting at 500 ms |
+| fixed pool 4, 20 × 200 ms | `ThreadPoolLabTest` | max 4 running, 16 queued, ≈ 1000 ms in 5 batches; virtual-thread-per-task: 20 running, ≈ 200 ms |
+| 50 virtual threads → downstream limited to 5 | `VirtualThreadLimitsLabTest` | 50 calls in flight on the client, 5 processed at a time, ≈ 2000 ms: the downstream decides throughput |
+| 30 virtual threads → DB pool of 10 | `DatabasePoolLimitLabTest` | ≤ 10 active connections, ~20 threads waiting for one, ≥ 600 ms |
+| lock, CPU | `VirtualThreadLimitsLabTest` | a lock still serializes; CPU-bound work is not faster on virtual threads |
+
+Virtual threads make *waiting* cheap (10 000 sleeping virtual threads finish in a few hundred ms). They do not add
+database connections, HTTP connections, downstream capacity, rate limits, lock throughput or CPU cores. The production
+checkout does not use them: its three steps are dependent, not independent, so there is nothing to parallelize.
 
 ## Frontend: `marketplace-web`
 
@@ -280,7 +366,9 @@ React 19 + TypeScript + Vite, plain CSS, no UI framework, no router, no global s
 - `App.tsx` owns the cart and the current view. It keeps the **checkout attempt key** in a `useRef`: created on
   the first click of an attempt, reused when the request failed in a way that may have reached the backend
   (network error, 5xx), cleared after an order came back or the backend rejected the request (4xx).
-  After checkout it reloads the cart (empty after success, restored after a failed payment).
+  After checkout it reloads the cart (empty after success, restored after a failed payment). After a stock-related
+  rejection (`CONCURRENT_STOCK_CHANGE`, `INSUFFICIENT_STOCK`, `PRODUCT_UNAVAILABLE`) it reloads cart and catalog; the
+  409 is definitive (nothing was ordered), so the next click is a new attempt with a new key.
 - `CartPanel` disables the button and uses a `useRef` guard so a double click sends one request. In development
   builds it shows a "Payment scenario (dev)" select for the simulation header.
 - `OrderConfirmation` renders the payment result: paid, declined, technical failure ("nothing was charged, items are
@@ -293,13 +381,15 @@ Backend `marketplace-service` (`mvn test`): unit tests (Mockito, domain), `Payme
 `FakePaymentServer`, a JDK `HttpServer` stand-in: timeouts, retry, same key, circuit breaker states, transaction guard),
 integration tests with Testcontainers PostgreSQL + MockMvc + `FakePaymentServer` (`PaymentCheckoutIntegrationTest`:
 paid, declined, retries, not processed, unknown → reconciliation, replay, concurrent duplicates, transaction boundary,
-open circuit).
+open circuit), Phase 3 race tests in `concurrency/` (last unit, stock paths, cart, order outcome vs reconciliation,
+lock scope), `common/ConcurrencyErrorMappingTest`, and the training lab in `lab/`.
 
 payment-service (`mvn test`): `PaymentServiceTest` (idempotency incl. 32 concurrent threads), `ScenarioSimulatorTest`,
 `PaymentApiIntegrationTest` (real HTTP on a random port: every scenario, 16 concurrent HTTP requests with one key).
 
 Frontend (`npm test`, Vitest + Testing Library): idempotency key reuse per attempt, one request per double click,
-rendering of paid/declined/technical failure/unknown, reconciliation button.
+rendering of paid/declined/technical failure/unknown, reconciliation button, reload + new attempt after
+`CONCURRENT_STOCK_CHANGE`.
 
 ## Not implemented yet (deliberately)
 
@@ -309,8 +399,8 @@ rendering of paid/declined/technical failure/unknown, reconciliation button.
 - **Durable payment storage:** payment-service is in memory; a restart forgets payments (and reconciliation would then
   find nothing).
 - **Events:** no Kafka, no outbox (Phase 4). The payment call is synchronous inside the checkout request.
-- **Concurrency handling:** an `OptimisticLockingFailureException` from two shoppers buying the same product at the same
-  moment still ends as a 500 (Phase 3). Duplicate checkouts of the same attempt are handled (see above).
+- **Stock reservation / server-side retry of optimistic conflicts:** a conflicting buyer gets 409 and must retry, even
+  when enough units were left (false conflict on a hot product). See Concurrency for the alternatives.
 - **Security:** no users, authentication or service-to-service auth; `X-Session-Id` is a bearer identifier only.
 - **Operations:** no metrics, tracing, Actuator/health checks, containerized services or deployment.
 - Catalog management, pagination, stock reservation with expiry, multiple currencies, taxes, shipping.

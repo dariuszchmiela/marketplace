@@ -5,7 +5,10 @@ import java.util.UUID;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
+import pl.dch.marketplace.common.ErrorCode;
+import pl.dch.marketplace.common.MarketplaceException;
 import pl.dch.marketplace.order.Order;
 import pl.dch.marketplace.order.OrderResponse;
 import pl.dch.marketplace.payment.PaymentClient;
@@ -52,17 +55,15 @@ public class CheckoutService {
         try {
             placed = orderPlacement.placeOrder(sessionId, checkoutIdempotencyKey);
         } catch (RuntimeException ex) {
-            // A concurrent request with the same key may have committed first. Depending on timing our
-            // transaction then fails on the unique constraint, on the stock version, or - if the winner
-            // committed between our key lookup and our cart read - with CART_EMPTY / INSUFFICIENT_STOCK.
-            // Whatever the cause: if an order exists for this key, it is the idempotent answer.
-            // Otherwise the failure is real and is rethrown.
+            // Safety net for duplicates of the same attempt: if an order exists for this key, it is the
+            // idempotent answer, whatever made our transaction fail. (Same-session checkouts are normally
+            // serialized by the cart row lock in OrderPlacementService, so this is rarely needed.)
             return orderPlacement.findByCheckoutKey(sessionId, checkoutIdempotencyKey)
                     .map(order -> {
                         log.info("checkout.concurrent_duplicate orderId={} checkoutKey={}", order.id(), checkoutIdempotencyKey);
                         return CheckoutResult.replayed(order);
                     })
-                    .orElseThrow(() -> ex);
+                    .orElseThrow(() -> translate(ex, checkoutIdempotencyKey));
         }
         if (!placed.created()) {
             log.info("checkout.replayed orderId={} status={} checkoutKey={}",
@@ -80,6 +81,22 @@ public class CheckoutService {
                 paymentScenario);
 
         return CheckoutResult.created(orderPaymentUpdater.applyOutcome(order.id(), outcome));
+    }
+
+    /**
+     * Transaction 1 updates only one versioned entity: {@code Product} (stock). An optimistic lock failure
+     * therefore always means that another checkout (or a stock return) changed the stock of a product in
+     * this cart between our read and our write. The whole transaction was rolled back (no order, stock and
+     * cart unchanged), so the client can safely retry as a new checkout attempt.
+     */
+    private static RuntimeException translate(RuntimeException failure, UUID checkoutIdempotencyKey) {
+        if (failure instanceof OptimisticLockingFailureException) {
+            log.info("checkout.stock_conflict checkoutKey={} detail=\"{}\"", checkoutIdempotencyKey, failure.getMessage());
+            return new MarketplaceException(ErrorCode.CONCURRENT_STOCK_CHANGE,
+                    "Another purchase changed the stock of a product in your cart at the same time. "
+                            + "Nothing was ordered or charged; please review your cart and try again.");
+        }
+        return failure;
     }
 
     /**

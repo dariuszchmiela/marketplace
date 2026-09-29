@@ -90,6 +90,7 @@ public final class FakePaymentServer implements AutoCloseable {
     private volatile int postCount;
     private volatile Integer lookupFailureStatus;
     private volatile Consumer<RecordedRequest> beforePostHandling = request -> { };
+    private volatile Consumer<RecordedRequest> beforeLookupHandling = request -> { };
 
     private FakePaymentServer(HttpServer server) {
         this.server = server;
@@ -121,6 +122,7 @@ public final class FakePaymentServer implements AutoCloseable {
         postCount = 0;
         lookupFailureStatus = null;
         beforePostHandling = request -> { };
+        beforeLookupHandling = request -> { };
     }
 
     public synchronized void respondWith(Behaviour... behaviours) {
@@ -131,6 +133,11 @@ public final class FakePaymentServer implements AutoCloseable {
     /** Runs on the server thread while the marketplace waits for the POST response. */
     public void beforePostHandling(Consumer<RecordedRequest> hook) {
         this.beforePostHandling = hook;
+    }
+
+    /** Runs on the server thread while the marketplace waits for the reconciliation lookup. */
+    public void beforeLookupHandling(Consumer<RecordedRequest> hook) {
+        this.beforeLookupHandling = hook;
     }
 
     public void failLookupsWith(int status) {
@@ -167,6 +174,7 @@ public final class FakePaymentServer implements AutoCloseable {
             if (request.method().equals("POST") && request.path().equals("/api/payments")) {
                 handlePost(exchange, request);
             } else if (request.method().equals("GET") && request.path().startsWith("/api/payments/by-idempotency-key/")) {
+                beforeLookupHandling.accept(request);
                 handleLookup(exchange, request.path().substring("/api/payments/by-idempotency-key/".length()));
             } else {
                 send(exchange, 404, "{\"code\":\"NOT_FOUND\"}");

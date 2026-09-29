@@ -7,6 +7,7 @@ import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.MessageSourceResolvable;
+import org.springframework.dao.ConcurrencyFailureException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
@@ -45,6 +46,19 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     ResponseEntity<ApiError> handleTypeMismatch(MethodArgumentTypeMismatchException ex, WebRequest request) {
         String message = "Invalid value for parameter '%s'".formatted(ex.getName());
         return build(HttpStatus.BAD_REQUEST, ErrorCode.MALFORMED_REQUEST, message, request, List.of());
+    }
+
+    /**
+     * Safety net for expected races that no service translated into a more specific code:
+     * optimistic lock conflicts, lock timeouts and deadlock victims ({@link ConcurrencyFailureException}
+     * is the common parent). They are a 409 "try again", not a server error. No JPA/SQL details are exposed.
+     */
+    @ExceptionHandler(ConcurrencyFailureException.class)
+    ResponseEntity<ApiError> handleConcurrencyFailure(ConcurrencyFailureException ex, WebRequest request) {
+        log.warn("request.concurrency_conflict type={} path={}", ex.getClass().getSimpleName(), pathOf(request));
+        return build(HttpStatus.CONFLICT, ErrorCode.CONCURRENT_MODIFICATION,
+                "The data was changed by another request at the same time. Please refresh and try again.",
+                request, List.of());
     }
 
     @ExceptionHandler(Exception.class)
@@ -127,7 +141,8 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
                  INVALID_IDEMPOTENCY_KEY, INVALID_QUANTITY, REQUEST_FAILED -> HttpStatus.BAD_REQUEST;
             case PRODUCT_NOT_FOUND, CART_ITEM_NOT_FOUND, ORDER_NOT_FOUND, NOT_FOUND -> HttpStatus.NOT_FOUND;
             case METHOD_NOT_ALLOWED -> HttpStatus.METHOD_NOT_ALLOWED;
-            case PRODUCT_UNAVAILABLE, INSUFFICIENT_STOCK, PAYMENT_RECONCILIATION_CONFLICT -> HttpStatus.CONFLICT;
+            case PRODUCT_UNAVAILABLE, INSUFFICIENT_STOCK, CONCURRENT_STOCK_CHANGE, CONCURRENT_MODIFICATION,
+                 PAYMENT_RECONCILIATION_CONFLICT -> HttpStatus.CONFLICT;
             case PAYMENT_SERVICE_UNAVAILABLE -> HttpStatus.SERVICE_UNAVAILABLE;
             case CART_EMPTY -> HttpStatus.UNPROCESSABLE_CONTENT;
             case INTERNAL_ERROR -> HttpStatus.INTERNAL_SERVER_ERROR;

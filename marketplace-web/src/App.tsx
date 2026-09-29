@@ -17,6 +17,10 @@ function mayHaveBeenProcessed(error: unknown): boolean {
   return !(error instanceof ApiError) || error.status === 0 || error.status >= 500
 }
 
+// The backend rejected the checkout because stock changed (e.g. another shopper bought the last unit at the
+// same moment). Nothing was ordered; the shopper needs fresh stock numbers before trying again.
+const STOCK_CHANGED_CODES = new Set(['CONCURRENT_STOCK_CHANGE', 'INSUFFICIENT_STOCK', 'PRODUCT_UNAVAILABLE'])
+
 export function App() {
   const [view, setView] = useState<View>({ kind: 'shop' })
   // The cart lives here because both the product list (add) and the cart panel use it.
@@ -26,6 +30,8 @@ export function App() {
   // One checkout attempt = one idempotency key. Kept in a ref: it is not rendered, and it must
   // survive re-renders between a failed request and its retry.
   const checkoutAttemptKey = useRef<string | null>(null)
+  // Changing the key remounts the product list, which reloads the catalog (stock numbers).
+  const [catalogVersion, setCatalogVersion] = useState(0)
 
   useEffect(() => {
     const controller = new AbortController()
@@ -71,6 +77,10 @@ export function App() {
         // Rejected before anything happened (e.g. empty cart, stock): the next click is a new attempt.
         checkoutAttemptKey.current = null
       }
+      if (error instanceof ApiError && STOCK_CHANGED_CODES.has(error.code)) {
+        setCatalogVersion((version) => version + 1)
+        await refreshCart()
+      }
       throw error
     }
     checkoutAttemptKey.current = null
@@ -106,7 +116,7 @@ export function App() {
         />
       ) : (
         <main className="shop">
-          <ProductList onAddToCart={addToCart} />
+          <ProductList key={catalogVersion} onAddToCart={addToCart} />
           <aside>
             {cartError && <ErrorMessage message={cartError} />}
             {!cart && !cartError && <p className="muted">Loading cart…</p>}

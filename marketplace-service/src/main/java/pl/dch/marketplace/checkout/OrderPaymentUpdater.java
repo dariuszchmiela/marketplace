@@ -1,5 +1,7 @@
 package pl.dch.marketplace.checkout;
 
+import java.util.Comparator;
+import java.util.List;
 import java.util.UUID;
 
 import org.slf4j.Logger;
@@ -90,10 +92,18 @@ public class OrderPaymentUpdater {
                         "Order %d not found".formatted(orderId)));
     }
 
+    /**
+     * Compensation. Runs at most once per order: only for an order that was still awaiting its result,
+     * under the order row lock, in the same transaction as the transition to {@code PAYMENT_FAILED}.
+     * Locks in the global order (order → cart → products by ascending id) so it cannot deadlock with
+     * a checkout or a cart edit.
+     */
     private void returnItems(Order order) {
-        Cart cart = cartRepository.findBySessionId(order.getSessionId())
-                .orElseGet(() -> cartRepository.save(new Cart(order.getSessionId())));
-        for (OrderLine line : order.getLines()) {
+        Cart cart = cartRepository.lockOrCreate(order.getSessionId());
+        List<OrderLine> linesByProduct = order.getLines().stream()
+                .sorted(Comparator.comparing(OrderLine::getProductId))
+                .toList();
+        for (OrderLine line : linesByProduct) {
             productRepository.increaseStock(line.getProductId(), line.getQuantity());
             cart.restoreItem(line.getProductId(), line.getQuantity());
         }

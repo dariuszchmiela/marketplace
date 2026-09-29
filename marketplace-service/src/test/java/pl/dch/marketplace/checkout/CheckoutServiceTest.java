@@ -13,6 +13,7 @@ import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.test.util.ReflectionTestUtils;
 import pl.dch.marketplace.common.ErrorCode;
 import pl.dch.marketplace.common.MarketplaceException;
@@ -118,6 +119,18 @@ class CheckoutServiceTest {
 
         assertThat(result.order()).isEqualTo(orderResponse);
         assertThat(result.created()).isFalse();
+    }
+
+    @Test
+    void stockVersionConflictIsTranslatedToAConcurrentStockChange() {
+        when(orderPlacement.placeOrder(SESSION, CHECKOUT_KEY))
+                .thenThrow(new ObjectOptimisticLockingFailureException("pl.dch.marketplace.product.Product", 1L));
+        when(orderPlacement.findByCheckoutKey(SESSION, CHECKOUT_KEY)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> checkoutService.checkout(SESSION, CHECKOUT_KEY, null))
+                .isInstanceOf(MarketplaceException.class)
+                .extracting("code").isEqualTo(ErrorCode.CONCURRENT_STOCK_CHANGE);
+        verifyNoInteractions(paymentClient, orderPaymentUpdater);
     }
 
     @Test

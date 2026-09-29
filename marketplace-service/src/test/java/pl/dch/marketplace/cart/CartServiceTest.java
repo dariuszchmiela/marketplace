@@ -64,7 +64,7 @@ class CartServiceTest {
 
     @Test
     void addsProductToNewCartAndReturnsCurrentPrices() {
-        when(cartRepository.findBySessionId(SESSION.value())).thenReturn(Optional.empty());
+        when(cartRepository.lockOrCreate(SESSION.value())).thenReturn(new Cart(SESSION.value()));
 
         CartResponse response = cartService.addItem(SESSION, 1L, 2);
 
@@ -224,7 +224,10 @@ class CartServiceTest {
     private Cart cartWith(long productId, int quantity) {
         Cart cart = new Cart(SESSION.value());
         cart.addItem(productId, quantity);
+        // Reads use the plain lookup, mutations the locking ones (see CartRepository).
         when(cartRepository.findBySessionId(SESSION.value())).thenReturn(Optional.of(cart));
+        when(cartRepository.findBySessionIdForUpdate(SESSION.value())).thenReturn(Optional.of(cart));
+        when(cartRepository.lockOrCreate(SESSION.value())).thenReturn(cart);
         return cart;
     }
 }

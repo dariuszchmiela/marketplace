@@ -15,6 +15,10 @@ import pl.dch.marketplace.product.Product;
 import pl.dch.marketplace.product.ProductRepository;
 import pl.dch.marketplace.session.SessionId;
 
+/**
+ * Every mutation locks the cart row first (see {@link CartRepository}), so concurrent requests for the
+ * same cart are applied one after another instead of overwriting each other.
+ */
 @Service
 @Transactional
 public class CartService {
@@ -40,8 +44,7 @@ public class CartService {
     public CartResponse addItem(SessionId sessionId, long productId, int quantity) {
         CartItem.requireValidQuantity(quantity);
         Product product = findProduct(productId);
-        Cart cart = cartRepository.findBySessionId(sessionId.value())
-                .orElseGet(() -> cartRepository.save(new Cart(sessionId.value())));
+        Cart cart = cartRepository.lockOrCreate(sessionId.value());
 
         // The quantity limit is checked before stock: exceeding it is a client error, not a stock conflict.
         ensureStock(product, cart.quantityAfterAdding(productId, quantity));
@@ -51,7 +54,7 @@ public class CartService {
 
     public CartResponse updateItemQuantity(SessionId sessionId, long productId, int quantity) {
         CartItem.requireValidQuantity(quantity);
-        Cart cart = cartRepository.findBySessionId(sessionId.value())
+        Cart cart = cartRepository.findBySessionIdForUpdate(sessionId.value())
                 .orElseThrow(() -> cartItemNotFound(productId));
         Product product = findProduct(productId);
 
@@ -61,7 +64,7 @@ public class CartService {
     }
 
     public CartResponse removeItem(SessionId sessionId, long productId) {
-        return cartRepository.findBySessionId(sessionId.value())
+        return cartRepository.findBySessionIdForUpdate(sessionId.value())
                 .map(cart -> {
                     cart.removeItem(productId);
                     return toResponse(cart);

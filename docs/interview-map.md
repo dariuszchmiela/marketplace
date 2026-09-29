@@ -1,11 +1,12 @@
 # Interview map
 
-Where each interview topic can be demonstrated in the **current** code (Phases 1–2).
+Where each interview topic can be demonstrated in the **current** code (Phases 1–3).
 Topics for later phases are listed at the bottom as planned only. They have no code yet.
 
 Paths are relative to `marketplace-service/src/main/java/pl/dch/marketplace/` (backend),
 `payment-service/src/main/kotlin/pl/dch/payment/` (Kotlin service)
-and `marketplace-web/src/` (frontend) unless stated otherwise.
+and `marketplace-web/src/` (frontend) unless stated otherwise. Test-only paths (`concurrency/`, `lab/`) are under
+`marketplace-service/src/test/java/pl/dch/marketplace/`.
 
 ## Java / backend
 
@@ -27,7 +28,6 @@ and `marketplace-web/src/` (frontend) unless stated otherwise.
 | JPA mapping | `cart/Cart` ↔ `CartItem`, `order/Order` ↔ `OrderLine` | `mappedBy`, `cascade`, `orphanRemoval` (removing from the list deletes the row), `@OrderBy`, `@Enumerated(STRING)`, `updatable = false`. |
 | Dirty checking vs bulk update | `OrderPlacementService`: `product.decreaseStock(...)` without `save`; `ProductRepository.increaseStock` (`@Modifying` JPQL) | Managed entities are flushed at commit; an atomic `UPDATE … SET x = x + ?` bypasses the persistence context and cannot lose updates. |
 | N+1 queries | `CartRepository.findBySessionId`, `OrderRepository` (`@EntityGraph`) | Fetching children together with the parent; alternatives (JOIN FETCH, batch size). |
-| Optimistic locking (preparation) | `Product.version` (`@Version`) | What Hibernate does with it, what exception appears, why it is not handled yet (Phase 3 exercise). |
 | Schema migrations | `resources/db/migration/V1__…`, `V2__…`, `V3__payment_integration.sql`, `ddl-auto: validate` | Flyway vs `ddl-auto=update`, never editing applied migrations, unique and `CHECK` constraints as the last line of defence, why no FK on `cart_item.product_id`. |
 | Dependency injection | every service/controller | Constructor injection only, no field injection, easy unit testing without Spring. |
 | Replaceable boundary | `session/SessionIdArgumentResolver` | One place to swap anonymous session for real auth; an abstraction with a concrete reason. |
@@ -51,6 +51,33 @@ and `marketplace-web/src/` (frontend) unless stated otherwise.
 | Kotlin service | `payment-service/`: data classes (`Payment`, DTOs), nullable request fields + `@field:` validation targets, `when`, `?:` / `?.`, `runApplication`, `kotlin-maven-plugin` with the `spring` (all-open) plugin | Kotlin vs Java for Spring: final-by-default and proxies, null safety with JSR-305, Jackson Kotlin module, `object`/`companion` for constants and loggers. |
 | Deterministic failure simulation | Kotlin `simulation/ScenarioSimulator` | Test hooks kept out of business code; no random failures; header forwarding only when explicitly enabled. |
 
+## Concurrency — production code (Phase 3)
+
+| Topic | Where | What to talk about |
+|---|---|---|
+| Race condition: last unit | test `concurrency/LastItemCheckoutConcurrencyIntegrationTest` (two sessions, stock 1) | Read–check–write race; why two sequential calls prove nothing; how the test forces the real interleaving (`RowLockHolder` + `pg_stat_activity` lock waiters) without sleeps in production code. |
+| Optimistic locking / `@Version` | `product/Product.version`, `Product.decreaseStock`, `checkout/OrderPlacementService` | `UPDATE … WHERE version = ?`, 0 rows → `StaleObjectStateException` → `ObjectOptimisticLockingFailureException` at commit; no lost update, no oversell; false conflicts on hot rows (measured in the stress test). |
+| 409 conflict translation | `checkout/CheckoutService.translate` (`CONCURRENT_STOCK_CHANGE`), `common/GlobalExceptionHandler.handleConcurrencyFailure` (`CONCURRENT_MODIFICATION`), test `common/ConcurrencyErrorMappingTest` | Expected races are business results (409, "refresh and try again"), not 500; translate where the context is known, keep a central safety net; never leak JPA/SQL text. |
+| Atomic update vs entity update | `product/ProductRepository.increaseStock`, test `concurrency/StockUpdateConcurrencyIntegrationTest.compensationDuringAPurchaseIsNotOverwritten` | Why the compensation must never fail; why it still bumps the version (otherwise the stale purchase overwrites the returned units — mutation-checked). Bulk JPQL bypasses the persistence context. |
+| Pessimistic locking, only where appropriate | `cart/CartRepository.findBySessionIdForUpdate` / `lockOrCreate`, `order/OrderRepository.findByIdForUpdate` | One owner, low contention, failing is worse than waiting → `SELECT … FOR UPDATE`; `INSERT … ON CONFLICT DO NOTHING` for race-free creation; no fetch join with `FOR UPDATE` (outer join). Tests: `CartConcurrencyIntegrationTest` (lost update 2 vs 11 before the fix). |
+| Idempotent compensation under concurrency | `checkout/OrderPaymentUpdater.applyOutcome` / `returnItems`; test `concurrency/OrderPaymentRaceIntegrationTest` | Row lock + final-state check = exactly-once effect of an at-least-once delivered result; checkout result vs reconciliation arriving together. |
+| Deadlock avoidance | lock order order → cart → products (ascending id), `hibernate.order_updates`, sorted lines in `returnItems` | Consistent lock ordering; what PostgreSQL does on a deadlock (one victim, mapped to 409 by the safety net). |
+| Locks never held across remote calls | `payment/PaymentClient.requireNoTransaction`; test `OrderPaymentRaceIntegrationTest.noRowLockOrTransactionIsHeldWhilePaymentServiceIsCalled` (`FOR UPDATE NOWAIT` probe) | Short critical sections; the checkout's three-step structure under concurrency. |
+
+## Concurrency lab — training experiments only (Phase 3)
+
+Test sources only (`lab/`), never part of the application. Observed timings are printed as `[LAB]` lines.
+
+| Topic | Where | What to talk about |
+|---|---|---|
+| Blocking I/O | `lab/DownstreamClient.get` (`HttpClient.send`), `lab/FakeDownstream` | The calling thread is parked while waiting; which thread that is decides everything below. |
+| Parallel independent calls | `lab/ProductPageLoader`: `loadSequentially` / `loadWithCompletableFuture` / `loadWithVirtualThreads`; `ParallelCallsLabTest` | Sum vs max of latencies (≈ 900 vs ≈ 300 ms); only *independent* calls can be parallelized (checkout's steps cannot). |
+| `CompletableFuture` + explicit executor | `ProductPageLoader.newIoExecutor`, `loadWithCompletableFuture` | `supplyAsync(…, executor)` instead of the common pool (sized for CPU, shared JVM-wide); `allOf` waits for all; fail-fast wiring with `anyOf`; `orTimeout`; one `join()` at the edge; `cancel` does not interrupt. |
+| Virtual threads | `loadWithVirtualThreads`, `Executors.newVirtualThreadPerTaskExecutor()` | Plain blocking code, cheap waiting; try-with-resources executor = structured lifetime; `StructuredTaskScope` (preview in Java 25) for fail-fast. |
+| Fixed thread pool, task queueing | `lab/ThreadPoolLabTest` | Pool of 4, 20 tasks: max 4 running, 16 queued, 5 batches (≈ 1000 ms); queue growth = latency growth. |
+| Downstream limits | `lab/VirtualThreadLimitsLabTest.fiftyVirtualThreads…` | 50 in flight, 5 processed (≈ 2000 ms): capacity is set by the downstream, not by the number of threads. |
+| Why virtual threads do not solve every bottleneck | `VirtualThreadLimitsLabTest` (lock, CPU), `lab/DatabasePoolLimitLabTest` (HikariCP 10) | They remove the thread-per-request cost of *waiting*; they do not add DB/HTTP connections, rate limits, lock throughput or CPU. |
+
 ## Frontend
 
 | Topic | Where | What to talk about |
@@ -60,6 +87,7 @@ and `marketplace-web/src/` (frontend) unless stated otherwise.
 | Local component state | `components/CartPanel.tsx` (`CartRow` draft quantity) | Controlled input as a draft; stable `key` (product id) plus adjusting state during render when the server quantity changes, instead of a remount or an effect. |
 | Duplicate submit | `CartPanel.handleCheckout`, `ProductList.handleAdd` | Disabled button **and** `useRef` guard; why state alone is not synchronous. Tests: `CartPanel.test.tsx`, `App.test.tsx` (one request per double click). |
 | Idempotency key per attempt | `App.tsx` (`checkoutAttemptKey` ref, `mayHaveBeenProcessed`) | New key per attempt, same key when retrying after a network error/5xx, new key after a 4xx; why a `useRef`, not state. Test: `App.test.tsx`. |
+| Handling a concurrency conflict | `App.tsx` (`STOCK_CHANGED_CODES`, `catalogVersion` key remounting `ProductList`) | 409 `CONCURRENT_STOCK_CHANGE`: show the message, reload cart and catalog, retry as a new attempt (definitive rejection) — unlike ambiguous 5xx. |
 | Rendering async results | `components/OrderConfirmation.tsx` | Paid / declined / technical failure / "Payment status is being verified." + reconciliation button; exhaustive `switch` over a string union. |
 | API error handling | `api/client.ts` | Typed `ApiError`, backend error body vs non-JSON error vs network failure, user-readable messages. |
 | Session identity in the browser | `session.ts` | `crypto.randomUUID`, `localStorage` failure fallback, validating stored data. |
@@ -73,8 +101,8 @@ Listed only to show where they will attach. Nothing below is implemented.
 | Topic | Planned phase / place |
 |---|---|
 | Scheduled reconciliation, expiry of never-found payments | later (see architecture.md, "Not implemented yet") |
-| Race condition on the last item, optimistic lock conflict handling | Phase 3: checkout + `Product.version` |
-| Thread pools, `CompletableFuture`, virtual threads, JMM | Phase 3 |
+| Server-side retry of optimistic conflicts, conditional atomic stock update, stock reservation | not planned yet (alternatives documented in architecture.md) |
+| JMM details (happens-before, `volatile`, safe publication) beyond what the lab uses | later |
 | Kafka, transactional outbox, consumer idempotency | Phase 4 |
 | Authentication, authorization, sessions vs JWT, CORS/CSRF | Phase 5: replaces `SessionIdArgumentResolver` |
 | Heap, GC, connection pool diagnostics | Phase 6 |

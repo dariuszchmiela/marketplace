@@ -47,19 +47,29 @@ public class OrderPlacementService {
     }
 
     /**
-     * Returns the existing order when this checkout key was already used by the session
-     * (sequential duplicate). Concurrent duplicates are stopped by the unique constraint on
-     * {@code (session_id, checkout_idempotency_key)}, see {@link CheckoutService}.
+     * Returns the existing order when this checkout key was already used by the session.
+     * <p>
+     * Concurrency:
+     * <ul>
+     *   <li>the cart row is locked first, so checkouts and cart edits of the <em>same</em> session run one
+     *       after another; a duplicate request waits and then finds the first request's order by its key
+     *       (the unique constraint on {@code (session_id, checkout_idempotency_key)} stays as the last guard);</li>
+     *   <li>checkouts of <em>different</em> sessions are not serialized. They compete only for product stock,
+     *       protected by {@code Product.@Version}: the loser's commit fails with an optimistic lock conflict,
+     *       translated by {@link CheckoutService} to 409 {@code CONCURRENT_STOCK_CHANGE}.</li>
+     * </ul>
      */
     @Transactional
     public PlacedOrder placeOrder(SessionId sessionId, UUID checkoutIdempotencyKey) {
+        Optional<Cart> lockedCart = cartRepository.findBySessionIdForUpdate(sessionId.value());
+
         Optional<Order> existing = orderRepository.findBySessionIdAndCheckoutIdempotencyKey(
                 sessionId.value(), checkoutIdempotencyKey);
         if (existing.isPresent()) {
             return PlacedOrder.existing(existing.get());
         }
 
-        Cart cart = cartRepository.findBySessionId(sessionId.value())
+        Cart cart = lockedCart
                 .filter(found -> !found.isEmpty())
                 .orElseThrow(() -> new MarketplaceException(ErrorCode.CART_EMPTY, "Cart is empty"));
 

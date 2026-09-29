@@ -68,7 +68,7 @@ class OrderPlacementServiceTest {
 
     @Test
     void rejectsCheckoutWhenSessionHasNoCart() {
-        when(cartRepository.findBySessionId(SESSION.value())).thenReturn(Optional.empty());
+        when(cartRepository.findBySessionIdForUpdate(SESSION.value())).thenReturn(Optional.empty());
 
         assertCheckoutFailsWith(ErrorCode.CART_EMPTY);
     }
@@ -185,7 +185,7 @@ class OrderPlacementServiceTest {
     }
 
     private void givenCart(Cart cart) {
-        when(cartRepository.findBySessionId(SESSION.value())).thenReturn(Optional.of(cart));
+        when(cartRepository.findBySessionIdForUpdate(SESSION.value())).thenReturn(Optional.of(cart));
     }
 
     private void givenCatalog(Product... products) {

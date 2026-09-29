@@ -3,17 +3,27 @@
 A small, working marketplace used as a training ground for a Senior Fullstack (Java/Kotlin + React)
 technical interview. It is **not** a portfolio clone of a real marketplace: every piece exists to give
 concrete, runnable examples for interview topics (Stream API, money, transactions, JPA, REST, React state,
-HTTP resilience, idempotency, distributed failures, …).
+HTTP resilience, idempotency, distributed failures, concurrency, thread pools, virtual threads, …).
 
-Current state: **Phase 2, payment integration + resilience**:
+Current state: **Phase 3, concurrency lab** (on top of Phase 2, payment integration + resilience):
 
 ```text
 Product list → Cart → Checkout → Order (PAYMENT_PENDING) → payment-service → PAID / PAYMENT_FAILED / PAYMENT_UNKNOWN
                                                                                    └─ reconciliation → PAID / PAYMENT_FAILED
 ```
 
+Phase 3 made the production path safe under concurrency and added a separate training lab:
+
+- **Production behaviour:** two shoppers buying the last unit → exactly one order, the other gets
+  `409 CONCURRENT_STOCK_CHANGE` (optimistic locking on `Product.@Version`); concurrent edits of one cart are
+  serialized by a cart row lock (no lost updates); a payment result arriving twice compensates stock/cart only once;
+  no lock or transaction is held during remote calls.
+- **Training experiments only** (`marketplace-service/src/test/java/pl/dch/marketplace/lab`, never part of the
+  application): sequential vs `CompletableFuture` vs virtual threads, fixed thread pool queueing, and what virtual
+  threads do not fix (downstream limits, DB pool, locks, CPU).
+
 See [`docs/architecture.md`](docs/architecture.md) for the design (transaction boundaries, idempotency, retry,
-circuit breaker, unknown results, and what is deliberately not built yet) and
+circuit breaker, unknown results, concurrency strategy, the lab, and what is deliberately not built yet) and
 [`docs/interview-map.md`](docs/interview-map.md) for where each interview topic lives in the code.
 
 ## Prerequisites
@@ -86,6 +96,10 @@ Open http://localhost:5173. The Vite dev server proxies `/api` to `localhost:808
 # payment-service is replaced by an in-process HTTP stand-in)
 cd marketplace-service
 mvn test
+
+# only the Phase 3 race tests, or only the training lab ([LAB] lines show the observed timings)
+mvn test -Dtest='pl.dch.marketplace.concurrency.*Test'
+mvn test -Dtest='pl.dch.marketplace.lab.*Test'
 
 # payment-service: unit tests + HTTP tests on a random port (no Docker needed)
 cd payment-service

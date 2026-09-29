@@ -2,8 +2,15 @@ package pl.dch.marketplace;
 
 import java.math.BigDecimal;
 import java.util.UUID;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+import javax.sql.DataSource;
 
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -23,6 +30,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
  * Full application against a real PostgreSQL (Testcontainers) with Flyway migrations applied, and a
@@ -61,13 +69,28 @@ public abstract class IntegrationTestBase {
     @Autowired
     protected CircuitBreaker paymentCircuitBreaker;
 
+    @Autowired
+    protected DataSource dataSource;
+
     protected final String session = UUID.randomUUID().toString();
+
+    // For concurrent requests; MockMvc itself is thread safe.
+    private final ExecutorService requestThreads = Executors.newCachedThreadPool();
 
     @BeforeEach
     void resetPaymentService() {
         PAYMENT_SERVICE.reset();
         // The circuit breaker is a singleton in the shared context; failures of one test must not leak.
         paymentCircuitBreaker.reset();
+    }
+
+    @AfterEach
+    void stopRequestThreads() {
+        requestThreads.shutdownNow();
+    }
+
+    protected <T> Future<T> inBackground(Callable<T> task) {
+        return requestThreads.submit(task);
     }
 
     protected Product createProduct(String name, String price, int availableQuantity) {
@@ -101,6 +124,17 @@ public abstract class IntegrationTestBase {
 
     protected MockHttpServletRequestBuilder checkout(UUID idempotencyKey) {
         return post("/api/checkout").header(SESSION_HEADER, session).header(IDEMPOTENCY_KEY_HEADER, idempotencyKey);
+    }
+
+    /** Checkout of another session (fresh idempotency key). */
+    protected MockHttpServletRequestBuilder checkoutAs(String otherSession) {
+        return post("/api/checkout").header(SESSION_HEADER, otherSession).header(IDEMPOTENCY_KEY_HEADER, UUID.randomUUID());
+    }
+
+    protected void addToCart(String anySession, long productId, int quantity) throws Exception {
+        mockMvc.perform(post("/api/cart/items").header(SESSION_HEADER, anySession)
+                        .contentType(MediaType.APPLICATION_JSON).content(addItemJson(productId, quantity)))
+                .andExpect(status().isOk());
     }
 
     protected MockHttpServletRequestBuilder reconcilePayment(long orderId) {
